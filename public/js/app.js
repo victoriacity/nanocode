@@ -175,6 +175,14 @@ function showNotifyToast(msg, duration = 6000) {
   el._timer = setTimeout(() => { el.style.opacity = '0' }, duration)
 }
 
+// Reconnect backoff for /ws/notify. The old worker process (pre-v1.3.0)
+// doesn't have a /ws/notify handler, so the proxy returns 502 every time.
+// Without backoff we hammer the (overloaded) worker every 5s forever,
+// taking accept-queue slots away from /ws/terminal and /api/* that
+// actually need to work. Exponential backoff up to 5min — if the
+// endpoint comes online (worker restart picks up extras.js) the next
+// scheduled attempt finds it.
+let _notifyAttempts = 0
 function initNotifyWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const ws = new WebSocket(`${proto}//${location.host}/ws/notify`)
@@ -199,131 +207,19 @@ function initNotifyWs() {
         playNotifySound('blocked')
         if (document.hidden || !document.hasFocus()) _addUnread()
         console.log('[notify]', text)
-      } else if (msg.type === 'service_status') {
-        updateServiceDot(msg.name, msg.status, msg.checkedAt)
       } else if (msg.type === 'activity') {
         console.log('[activity]', msg.repo, msg.heading)
       }
     } catch {}
   }
-  ws.onclose = () => setTimeout(initNotifyWs, 5000)
+  ws.onopen = () => { _notifyAttempts = 0 }
+  ws.onclose = () => {
+    _notifyAttempts++
+    // 5s, 10s, 20s, 40s, 80s, capped at 5min. After ~7 attempts at 5min.
+    const delay = Math.min(5 * 60_000, 5000 * Math.pow(2, Math.min(_notifyAttempts - 1, 6)))
+    setTimeout(initNotifyWs, delay)
+  }
   ws.onerror = () => {}
-}
-
-// ─── Services health ──────────────────────────────────────────────────────────
-
-let _servicesConfig = []
-
-function updateServiceDot(name, status, checkedAt) {
-  const dot = document.getElementById(`svc-dot-${name}`)
-  if (dot) {
-    dot.className = `service-dot ${status}`
-    dot.title = `${name}: ${status}${checkedAt ? ' (checked ' + checkedAt.slice(11, 16) + ' UTC)' : ''}`
-  }
-}
-
-function _renderServicesGrid(services, status) {
-  const grid = document.getElementById('services-grid')
-  if (!grid) return
-  grid.innerHTML = ''
-  for (const svc of services) {
-    const info = status[svc.name] || { status: 'unknown' }
-    const row = document.createElement('div')
-    row.className = 'service-item'
-    row.dataset.svc = svc.name
-    row.innerHTML = `
-      <span class="service-dot ${info.status}" id="svc-dot-${svc.name}" title="${svc.name}: ${info.status}"></span>
-      <span class="service-name">${svc.name} <span class="service-port">${svc.host}:${svc.port}</span></span>
-      <span class="service-actions">
-        <button type="button" class="svc-btn svc-edit-btn" data-name="${svc.name}" title="Edit">&#9998;</button>
-        <button type="button" class="svc-btn svc-del-btn" data-name="${svc.name}" title="Delete">&#10005;</button>
-      </span>`
-    grid.appendChild(row)
-  }
-
-  grid.querySelectorAll('.svc-del-btn').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      _servicesConfig = _servicesConfig.filter(s => s.name !== btn.dataset.name)
-      await _saveServicesConfig()
-    })
-  })
-
-  grid.querySelectorAll('.svc-edit-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const name = btn.dataset.name
-      const svc = _servicesConfig.find(s => s.name === name)
-      if (!svc) return
-      const row = btn.closest('.service-item')
-      const dotStatus = (status[name] || {}).status || 'unknown'
-      row.innerHTML = `
-        <span class="service-dot ${dotStatus}" id="svc-dot-${name}"></span>
-        <input type="text" class="settings-input svc-edit-name" value="${svc.name}" style="width:90px" />
-        <input type="text" class="settings-input svc-edit-host" value="${svc.host}" style="width:120px" />
-        <input type="number" class="settings-input svc-edit-port" value="${svc.port}" min="1" max="65535" style="width:60px" />
-        <button type="button" class="btn btn-primary svc-save-btn" style="padding:2px 8px;font-size:12px">Save</button>
-        <button type="button" class="svc-btn svc-cancel-btn">&#10005;</button>`
-      row.querySelector('.svc-save-btn').addEventListener('click', async () => {
-        const newName = row.querySelector('.svc-edit-name').value.trim()
-        const newHost = row.querySelector('.svc-edit-host').value.trim()
-        const newPort = parseInt(row.querySelector('.svc-edit-port').value, 10)
-        if (!newName || !newHost || !newPort) return
-        const idx = _servicesConfig.findIndex(s => s.name === name)
-        if (idx >= 0) _servicesConfig[idx] = { name: newName, host: newHost, port: newPort }
-        await _saveServicesConfig()
-      })
-      row.querySelector('.svc-cancel-btn').addEventListener('click', () => loadServices())
-    })
-  })
-}
-
-async function _saveServicesConfig() {
-  try {
-    await fetch('/api/services-config', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ services: _servicesConfig }),
-    })
-    await loadServices()
-  } catch {}
-}
-
-async function loadServices() {
-  try {
-    const [cfgRes, statusRes] = await Promise.all([
-      fetch('/api/services-config').then(r => r.json()),
-      fetch('/api/services').then(r => r.json()),
-    ])
-    _servicesConfig = cfgRes.services || []
-
-    const ipEl = document.getElementById('services-local-ip')
-    if (ipEl && cfgRes.localIPs?.length) ipEl.textContent = `Local: ${cfgRes.localIPs.join(', ')}`
-
-    _renderServicesGrid(_servicesConfig, statusRes)
-
-    let lastChecked = null
-    for (const info of Object.values(statusRes)) {
-      if (info.checkedAt && (!lastChecked || info.checkedAt > lastChecked)) lastChecked = info.checkedAt
-    }
-    const el = document.getElementById('services-checked-at')
-    if (el && lastChecked) el.textContent = `Last checked: ${lastChecked.slice(0, 16).replace('T', ' ')} UTC`
-  } catch {}
-}
-
-// Wire Add service form
-const _svcAddForm = document.getElementById('services-add-form')
-if (_svcAddForm) {
-  _svcAddForm.addEventListener('submit', async (e) => {
-    e.preventDefault()
-    const name = document.getElementById('svc-add-name').value.trim()
-    const host = document.getElementById('svc-add-host').value.trim()
-    const port = parseInt(document.getElementById('svc-add-port').value, 10)
-    if (!name || !host || !port) return
-    _servicesConfig = [..._servicesConfig, { name, host, port }]
-    await _saveServicesConfig()
-    document.getElementById('svc-add-name').value = ''
-    document.getElementById('svc-add-host').value = ''
-    document.getElementById('svc-add-port').value = ''
-  })
 }
 
 // ─── Notification Sounds ──────────────────────────────────────────────────────
@@ -1177,7 +1073,6 @@ async function openSettingsPanel() {
   let serverSettings = {}
   try { serverSettings = await fetchSettings() } catch {}
   loadSettings(serverSettings)
-  loadServices()
   loadAuthStatus()  // P1-4: refresh auth status on each open
   // Load dynamic model options in background
   fetchInitSnapshot().then((snapshot) => {

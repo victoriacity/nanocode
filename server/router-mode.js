@@ -199,10 +199,23 @@ export function startRouterMode({
   //
   // The worker only needs to handle /api/* and /ws/* from here on.
   const ASSET_DIR = path.join(ROOT, 'public')
-  const assetOpts = { maxAge: '7d' }
-  app.use(express.static(ASSET_DIR, assetOpts))
-  // Vendor libs live under node_modules; mount them under /vendor/*
-  // the same way server/index.js (single-user mode) does.
+  // App code (/js/*, /style.css, /index.html) must revalidate on every
+  // page load so a deploy reaches browsers without a hard-refresh.
+  // ETag-based 304 Not Modified makes this cheap. (Previously a 7-day
+  // max-age meant client fixes took up to a week to propagate, e.g.
+  // v1.3.3's renderMode default fix not showing up in the settings
+  // panel.)
+  app.use(express.static(ASSET_DIR, {
+    etag: true,
+    lastModified: true,
+    cacheControl: true,
+    maxAge: 0,
+    setHeaders(res) {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate')
+    },
+  }))
+  // Vendor libs (node_modules/* and public/vendor/*) are content-
+  // versioned by package.json — no revalidation needed; cache hard.
   const VENDOR_MAP = {
     '/vendor/xterm': 'node_modules/@xterm/xterm',
     '/vendor/xterm-addon-fit': 'node_modules/@xterm/addon-fit',

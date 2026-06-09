@@ -16,7 +16,13 @@
  *   - hljs       (UMD)
  */
 
-const POLL_INTERVAL_MS = 10_000
+// Explorer tree-refresh poll. 10s was hammering the worker (one parallel
+// GET /files per expanded directory on every tick — N=20 dirs ⇒ 20
+// requests every 10s ⇒ 2 req/s baseline JUST for the explorer). On a
+// worker already busy streaming PTY output from active agent tabs, this
+// stole accept-queue slots from /ws/terminal and / api/* that need them
+// more. 60s gives the same eventual-consistency UX but with 6× less load.
+const POLL_INTERVAL_MS = 60_000
 const POLL_DIR_CAP = 50
 const STORAGE_PREFIX = 'explorer:'
 

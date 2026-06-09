@@ -63,9 +63,6 @@ const translations = {
     'settings.subagent.activity': 'Show subagent activity (verbose, off by default)',
     'settings.fontsize.label': 'Terminal font size',
     // Monitor subsections
-    'settings.services.label': 'Port Health',
-    'settings.services.hint': 'Checked every 30s',
-    'settings.services.add': '+ Add',
     'settings.ntfy.label': 'ntfy Push',
     'settings.ntfy.hint': 'Leave blank to disable',
     'settings.ntfy.url': 'Server URL',
@@ -160,9 +157,6 @@ const translations = {
     'settings.subagent.activity': '显示 subagent 活动（通常较冗长，默认关）',
     'settings.fontsize.label': '终端字号',
     // Monitor subsections
-    'settings.services.label': '端口健康',
-    'settings.services.hint': '每 30s 检查',
-    'settings.services.add': '+ 添加',
     'settings.ntfy.label': 'ntfy 推送',
     'settings.ntfy.hint': '留空禁用',
     'settings.ntfy.url': '服务器 URL',

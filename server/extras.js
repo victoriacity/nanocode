@@ -26,10 +26,8 @@
 import express from 'express'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { createConnection } from 'node:net'
 import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 
 const execFileAsync = promisify(execFile)
 
@@ -40,16 +38,6 @@ export const ASSET_VERSION = String(Date.now())
 
 const VALID_CLI_PROVIDERS = new Set(['claude', 'agent', 'opencode', 'codex'])
 const AUTH_CACHE_MS = 60_000
-
-const DEFAULT_SERVICES = [
-  { name: 'mblend',      host: '10.18.8.55', port: 5050 },
-  { name: 'dccpipeline', host: '10.18.8.55', port: 8765 },
-  { name: 'regression',  host: '10.18.8.55', port: 8000 },
-  { name: 'nanocode',    host: 'localhost',  port: 3001 },
-  { name: 'TTS',         host: 'localhost',  port: 9880 },
-]
-
-const SERVICE_CHECK_MS = 30_000
 const TTS_BASE = process.env.TTS_URL || 'http://127.0.0.1:9880'
 
 export function createExtras({ store, configDir, qaWatcher } = {}) {
@@ -57,15 +45,9 @@ export function createExtras({ store, configDir, qaWatcher } = {}) {
   // Where services-config.json / agents-config.json live. The
   // single-user server uses server/, the worker uses
   // $HOME/.nanocode/ — caller passes the right one.
-  const SERVICES_CONFIG_PATH = path.join(configDir || '.', 'services-config.json')
   const AGENTS_CONFIG_PATH   = path.join(configDir || '.', 'agents-config.json')
 
   // --- state -----------------------------------------------------
-
-  let watchedServices = DEFAULT_SERVICES
-  try { watchedServices = JSON.parse(readFileSync(SERVICES_CONFIG_PATH, 'utf8')) } catch {}
-  const serviceStatus = {}
-  for (const s of watchedServices) serviceStatus[s.name] = { status: 'unknown', checkedAt: null }
 
   let agentsConfig = []
   try { agentsConfig = JSON.parse(readFileSync(AGENTS_CONFIG_PATH, 'utf8')) } catch {}
@@ -221,30 +203,8 @@ export function createExtras({ store, configDir, qaWatcher } = {}) {
     }
   })
 
-  // Services watcher
-  router.get('/api/services', (_req, res) => res.json(serviceStatus))
-  router.get('/api/services-config', (_req, res) =>
-    res.json({ services: watchedServices, localIPs: getLocalIPs() })
-  )
-  router.put('/api/services-config', (req, res) => {
-    const { services } = req.body
-    if (!Array.isArray(services)) return res.status(400).json({ error: 'services must be array' })
-    for (const s of services) {
-      if (!s.name || !s.host || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535) {
-        return res.status(400).json({ error: `invalid entry: ${JSON.stringify(s)}` })
-      }
-    }
-    watchedServices = services
-    for (const s of services) {
-      if (!serviceStatus[s.name]) serviceStatus[s.name] = { status: 'unknown', checkedAt: null }
-    }
-    for (const name of Object.keys(serviceStatus)) {
-      if (!services.find((s) => s.name === name)) delete serviceStatus[name]
-    }
-    try { writeFileSync(SERVICES_CONFIG_PATH, JSON.stringify(services, null, 2)) }
-    catch (e) { console.error('[services-config] write failed:', e.message) }
-    res.json({ ok: true })
-  })
+  // (Port Health / services watcher was removed; it was a fork-only
+  // feature and shouldn't be on main.)
 
   // Agent manager
   router.get('/api/agents', async (_req, res) => {
@@ -283,15 +243,7 @@ export function createExtras({ store, configDir, qaWatcher } = {}) {
 
   // --- watchers (call startWatchers() after the express mount) --
 
-  let watchersTimer = null
   function startWatchers() {
-    if (watchersTimer) return
-    setTimeout(() => runServiceChecks(watchedServices, serviceStatus, broadcastNotify), 5000)
-    watchersTimer = setInterval(
-      () => runServiceChecks(watchedServices, serviceStatus, broadcastNotify),
-      SERVICE_CHECK_MS,
-    )
-    watchersTimer.unref?.()
     qaWatcher?.start?.(broadcastNotify)
   }
 
@@ -300,42 +252,10 @@ export function createExtras({ store, configDir, qaWatcher } = {}) {
 
 // --- helpers ----------------------------------------------------
 
-function getLocalIPs() {
-  const ips = []
-  for (const iface of Object.values(os.networkInterfaces() || {})) {
-    for (const addr of iface || []) {
-      if (!addr.internal && addr.family === 'IPv4') ips.push(addr.address)
-    }
-  }
-  return ips
-}
-
-function checkPort(host, port) {
-  return new Promise((resolve) => {
-    const sock = createConnection({ host, port }, () => { sock.destroy(); resolve(true) })
-    sock.setTimeout(2000)
-    sock.on('timeout', () => { sock.destroy(); resolve(false) })
-    sock.on('error', () => resolve(false))
-  })
-}
-
 async function checkTmuxWindow(target) {
   if (!target) return 'unknown'
   try { await execFileAsync('tmux', ['has-session', '-t', target], { timeout: 2000 }); return 'running' }
   catch { return 'stopped' }
-}
-
-async function runServiceChecks(services, status, broadcast) {
-  for (const svc of services) {
-    const prev = status[svc.name]?.status
-    const up = await checkPort(svc.host, svc.port)
-    const next = up ? 'up' : 'down'
-    const checkedAt = new Date().toISOString()
-    status[svc.name] = { status: next, checkedAt }
-    if (prev && prev !== 'unknown' && prev !== next) {
-      broadcast({ type: 'service_status', name: svc.name, status: next, checkedAt })
-    }
-  }
 }
 
 async function handleTts(req, res, cfg) {

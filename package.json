@@ -1,6 +1,6 @@
 {
   "name": "nanocode",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "type": "module",
   "description": "Minimal terminal workspace for managing projects and AI coding assistants",
   "scripts": {
