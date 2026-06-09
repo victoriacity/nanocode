@@ -15,39 +15,82 @@
 
 import http from 'node:http'
 
+// A single keep-alive HTTP agent for every router→worker request.
+//
+// With the default globalAgent (keepAlive=false, maxSockets=Infinity)
+// a page-load that fires ~13 concurrent asset requests triggers ~13
+// brand-new socket() + connect() handshakes against the worker. Under
+// burst, some get RST mid-handshake — the proxy then surfaces the
+// failure to the browser as
+//
+//   {"error":"worker unavailable","detail":"ECONNRESET"}
+//
+// even though the worker is fully healthy. Empirically ~1.7% of
+// requests under realistic page-load concurrency.
+//
+// keepAlive=true reuses warm sockets — no thundering herd. maxSockets
+// caps the worker's concurrent inbound at a value its accept queue can
+// drain comfortably. maxFreeSockets keeps the pool warm between pages.
+const agent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  timeout: 30_000,
+})
+
+// Idempotent methods are safe to retry on a connection-reset error
+// (the server can't have committed any state if the connection was
+// never established or got RST before the request body was sent).
+const RETRYABLE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE'])
+
 /**
- * Forward an incoming http req/res to the user's worker.
+ * Forward an incoming http req/res to the user's worker. One retry
+ * on connection-level failures for idempotent methods.
  */
 export function proxyHttp(req, res, workerSock, user) {
-  const proxyReq = http.request({
-    socketPath: workerSock,
-    method: req.method,
-    path: req.url,
-    headers: {
-      ...req.headers,
-      host: 'worker.local',
-      'x-nano-uid': String(user.uid),
-      'x-nano-username': user.username,
-    },
-  })
+  attempt(0)
 
-  proxyReq.on('response', (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers)
-    proxyRes.pipe(res)
-  })
+  function attempt(tries) {
+    const proxyReq = http.request({
+      agent,
+      socketPath: workerSock,
+      method: req.method,
+      path: req.url,
+      headers: {
+        ...req.headers,
+        host: 'worker.local',
+        'x-nano-uid': String(user.uid),
+        'x-nano-username': user.username,
+      },
+    })
 
-  proxyReq.on('error', (err) => {
-    if (!res.headersSent) {
-      res.statusCode = 502
-      res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ error: 'worker unavailable', detail: err.code || err.message }))
-    } else {
-      res.destroy(err)
-    }
-  })
+    proxyReq.on('response', (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers)
+      proxyRes.pipe(res)
+    })
 
-  req.pipe(proxyReq)
-  req.on('error', () => proxyReq.destroy())
+    proxyReq.on('error', (err) => {
+      const retryable =
+        tries < 1 &&
+        !res.headersSent &&
+        RETRYABLE_METHODS.has(req.method) &&
+        RETRYABLE_CODES.has(err.code)
+      if (retryable) {
+        return attempt(tries + 1)
+      }
+      if (!res.headersSent) {
+        res.statusCode = 502
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ error: 'worker unavailable', detail: err.code || err.message }))
+      } else {
+        res.destroy(err)
+      }
+    })
+
+    req.pipe(proxyReq)
+    req.on('error', () => proxyReq.destroy())
+  }
 }
 
 /**
