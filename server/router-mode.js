@@ -188,7 +188,37 @@ export function startRouterMode({
     res.json({ uid: req.user.uid, username: req.user.username })
   })
 
+  // Static client assets — served by the router directly, after auth,
+  // BEFORE the worker proxy. Critical for resilience: when a worker
+  // process is overloaded (e.g. PTYs streaming heavy TUI redraws),
+  // its accept queue stalls and any proxied request gets 502. By
+  // serving every static file from the router we keep the cold-load
+  // shape (HTML, CSS, JS, vendor libs, fonts, images) decoupled from
+  // worker health — a stuck worker no longer means "markdown lost"
+  // or "xterm.js failed to load" or any other LCP-blocking 502.
+  //
+  // The worker only needs to handle /api/* and /ws/* from here on.
+  const ASSET_DIR = path.join(ROOT, 'public')
+  const assetOpts = { maxAge: '7d' }
+  app.use(express.static(ASSET_DIR, assetOpts))
+  // Vendor libs live under node_modules; mount them under /vendor/*
+  // the same way server/index.js (single-user mode) does.
+  const VENDOR_MAP = {
+    '/vendor/xterm': 'node_modules/@xterm/xterm',
+    '/vendor/xterm-addon-fit': 'node_modules/@xterm/addon-fit',
+    '/vendor/xterm-addon-web-links': 'node_modules/@xterm/addon-web-links',
+    '/vendor/marked': 'node_modules/marked/lib',
+    '/vendor/dompurify': 'node_modules/dompurify/dist',
+    '/vendor/highlight': 'public/vendor/highlight',
+    '/vendor/three': 'node_modules/three',
+  }
+  for (const [route, sub] of Object.entries(VENDOR_MAP)) {
+    app.use(route, express.static(path.join(ROOT, sub), { maxAge: '365d', immutable: true }))
+  }
+
   // All remaining traffic proxies to the user's worker.
+  // Static files have been consumed above; only /api/*, dynamic routes
+  // and anything not on disk reaches here.
   app.use((req, res) => {
     // Treat every proxied request as activity for the worker idle reaper,
     // so an in-use worker doesn't get evicted on a fixed wall-clock timer.
