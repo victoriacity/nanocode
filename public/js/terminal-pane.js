@@ -292,11 +292,7 @@ export class TerminalPane {
         if (msg.data) this.term.write(msg.data)
       } else if (msg.type === 'output') {
         const toWrite = this.localEcho.reconcile(msg.data)
-        if (toWrite) {
-          this.term.write(toWrite)
-          // Broadcast output for TTS and other listeners
-          document.dispatchEvent(new CustomEvent('nanocode:terminal-output', { detail: toWrite }))
-        }
+        if (toWrite) this.term.write(toWrite)
       } else if (msg.type === 'pong') {
         this._onPong(msg.id)
       } else if (msg.type === 'exit') {

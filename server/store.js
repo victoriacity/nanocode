@@ -97,12 +97,6 @@ export function createStore(filePath = ':memory:') {
       type,
       createdAt: Date.now(),
     }
-    if (type === 'claude') {
-      tab.claudeSessionId = opts.claudeSessionId || randomUUID()
-      tab.claudeSessionStarted = false
-    } else if (type === 'codex') {
-      tab.codexThreadId = opts.codexThreadId || null
-    }
     existing.push(tab)
     save()
     return { ...tab }
@@ -131,34 +125,6 @@ export function createStore(filePath = ':memory:') {
   function hasTab(projectId, tabId) {
     if (!data.tabs[projectId]) return false
     return data.tabs[projectId].some((t) => t.id === tabId)
-  }
-
-  function getTab(projectId, tabId) {
-    if (!data.tabs[projectId]) return null
-    const tab = data.tabs[projectId].find((t) => t.id === tabId)
-    return tab ? { ...tab } : null
-  }
-
-  function updateTabMetadata(projectId, tabId, patch = {}) {
-    if (!data.tabs[projectId]) return null
-    const tab = data.tabs[projectId].find((t) => t.id === tabId)
-    if (!tab) return null
-    const allowed = ['claudeSessionId', 'claudeSessionStarted', 'codexThreadId', 'pendingQueue']
-    let changed = false
-    for (const key of allowed) {
-      if (Object.prototype.hasOwnProperty.call(patch, key)) {
-        if (key === 'pendingQueue') {
-          // Always update array — deep-equality check is expensive and not needed
-          tab[key] = Array.isArray(patch[key]) ? patch[key] : []
-          changed = true
-        } else if (tab[key] !== patch[key]) {
-          tab[key] = patch[key]
-          changed = true
-        }
-      }
-    }
-    if (changed) save()
-    return { ...tab }
   }
 
   function migrateProjectsJson(jsonPath) {
@@ -196,7 +162,7 @@ export function createStore(filePath = ':memory:') {
     getSetting, setSetting, getAllSettings,
     createProject, getProject, listProjects, removeProject,
     migrateProjectsJson, ensureStarterProject,
-    listTabs, createTab, removeTab, renameTab, hasTab, getTab, updateTabMetadata,
+    listTabs, createTab, removeTab, renameTab, hasTab,
     close,
   }
 }

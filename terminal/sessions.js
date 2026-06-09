@@ -11,15 +11,7 @@ import {
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-// 12 ms was tight enough that on a busy host the worker's event loop
-// spent most of its budget on flush ticks (one JSON.stringify +
-// ws.send() per active client per 12 ms = ~83 Hz). A noisy agent (e.g.
-// codex's TUI redraws) compounded this to where new connections
-// couldn't be accept()ed. 50 ms is still well under perception
-// threshold (~20 Hz visual updates) and gives back ~75% of the
-// per-flush CPU budget. PTY scrollback continues to be batched at
-// SCROLLBACK_FLUSH_MS for disk persistence.
-const OUTPUT_FLUSH_MS = 50
+const OUTPUT_FLUSH_MS = 12
 const SCROLLBACK_SIZE = 100 * 1024 // 100KB
 const SCROLLBACK_FLUSH_MS = 5000
 
@@ -143,30 +135,17 @@ class Session {
       console.warn(`[pty] command not found: ${command}`)
     }
     console.log(`[pty] spawn: command=${command} args=${JSON.stringify(this._args)} cwd=${cwd}`)
-    // Strip session-identity vars that Claude Code sets in the parent process so
-    // that any `claude` invocations started inside this PTY (e.g. codex/agent/
-    // claude tab types or a user typing `claude` in a bash tab) get a clean
-    // environment and cannot accidentally re-use the main session's UUID.
-    // See the same strip logic in routes.js → buildClaudeChildEnv().
-    const STRIP_PTY_KEYS = new Set([
-      'CLAUDE_CODE_SESSION_ID',
-      'CLAUDECODE',
-      'CLAUDE_CODE_ENTRYPOINT',
-      'CLAUDE_CODE_EXECPATH',
-      'CLAUDE_CODE_TMPDIR',
-      'AI_AGENT',
-    ])
-    const ptyEnv = { TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3' }
-    for (const [k, v] of Object.entries(process.env)) {
-      if (!STRIP_PTY_KEYS.has(k)) ptyEnv[k] = v
-    }
-
     this._proc = pty.spawn(command, this._args, {
       name: 'xterm-256color',
       cols: Math.max(1, cols || 80),
       rows: Math.max(1, rows || 24),
       cwd,
-      env: ptyEnv,
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color',
+        COLORTERM: 'truecolor',
+        FORCE_COLOR: '3',
+      },
     })
 
     this._proc.onData((data) => {
@@ -174,25 +153,6 @@ class Session {
       this._outBuf += data
       if (!this._flushTimer) {
         this._flushTimer = setTimeout(() => this._flush(), OUTPUT_FLUSH_MS)
-      }
-      // N30: auto-skip codex update TUI.
-      // Codex shows an update prompt with options like "1. Update now" / "2. Skip".
-      // We detect specific patterns and auto-send the skip key after a short delay.
-      if (this._codexAutoSkipUpdate && !this._autoSkipSent) {
-        // Pattern: codex update TUI is identified by box-drawing chars + "Update available"
-        // or by the menu options "1." and "2." appearing after "Update"
-        const stripped = data.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\x1b[@-Z\\-_]/g, '')
-        if (/Update\s+available|Skip\s+this\s+update|›\s*2\b/.test(stripped) ||
-            /\[2\]\s*Skip|\(2\)\s*Skip|2\.\s*Skip|Skip\s+for\s+now/i.test(stripped)) {
-          this._autoSkipSent = true
-          // Send "2\n" to select "Skip" after 600ms
-          setTimeout(() => {
-            if (this._proc && !this._exited) {
-              console.log(`[pty:codex-autoskip] auto-sending skip for update prompt`)
-              this._proc.write('2\n')
-            }
-          }, 600)
-        }
       }
     })
 
@@ -273,17 +233,6 @@ class Session {
       ws.removeListener('message', onMessage)
       this.detach(ws)
     })
-  }
-
-  /**
-   * Enable automatic skip of codex update prompt (N30).
-   * Call this after getOrCreate() for codex tab types.
-   */
-  enableCodexAutoSkip() {
-    if (!this._codexAutoSkipUpdate) {
-      this._codexAutoSkipUpdate = true
-      this._autoSkipSent = false
-    }
   }
 
   /**

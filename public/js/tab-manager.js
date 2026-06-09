@@ -12,25 +12,6 @@
 import { TerminalPane } from './terminal-pane.js'
 import { fetchTabs, createTab, deleteTab, patchTab } from './api.js'
 
-// Block renderers (claude-block-renderer.js ~94 KB, codex-block-renderer.js
-// ~57 KB raw — 41 KB gz combined) are loaded LAZILY. Most users default
-// to the terminal renderer (renderMode='terminal'), so we don't ship
-// these on cold start. Cached once per module after first load.
-let _claudeBlockPromise = null
-let _codexBlockPromise = null
-function loadClaudeBlock() {
-  if (!_claudeBlockPromise) {
-    _claudeBlockPromise = import('./claude-block-renderer.js').then((m) => m.ClaudeBlockRenderer)
-  }
-  return _claudeBlockPromise
-}
-function loadCodexBlock() {
-  if (!_codexBlockPromise) {
-    _codexBlockPromise = import('./codex-block-renderer.js').then((m) => m.CodexBlockRenderer)
-  }
-  return _codexBlockPromise
-}
-
 const ACTIVE_KEY_PREFIX = 'activeTab:'
 
 function loadActiveId(projectId) {
@@ -330,40 +311,13 @@ export class TabManager {
       if (this.tabs.length) this.setActive(this.tabs[0].id)
       else this._renderStrip()
     } else if (!this.activeId && this.tabs.length) {
-      // First-time activation: prefer the last-active for this device, or the
-      // most-recently-active claude tab (by jsonl mtime) for cross-port resume.
+      // First-time activation: prefer the last-active for this device.
       const remembered = loadActiveId(this.projectId)
-      if (remembered && serverById.has(remembered)) {
-        this.setActive(remembered)
-      } else {
-        // No remembered tab for this device: auto-select the most recently active
-        // claude tab by querying the server (jsonl mtime). Falls back to tabs[0].
-        this._autoSelectMostRecentClaudeTab(serverById)
-      }
+      const target = (remembered && serverById.has(remembered)) ? remembered : this.tabs[0].id
+      this.setActive(target)
     } else {
       this._renderStrip()
     }
-  }
-
-  /**
-   * Query /api/projects/:id/most-recent-claude-tab and activate that tab.
-   * Falls back to tabs[0] if the API fails or returns null.
-   * Only called on first-time activation (no remembered tab for this device).
-   */
-  async _autoSelectMostRecentClaudeTab(serverById) {
-    let tabId = null
-    try {
-      const resp = await fetch(`/api/projects/${this.projectId}/most-recent-claude-tab`)
-      if (resp.ok) {
-        const data = await resp.json()
-        tabId = data?.tabId || null
-      }
-    } catch {}
-
-    // Pick the API result if it's valid, else fall back to first tab
-    const target = (tabId && serverById.has(tabId)) ? tabId : this.tabs[0]?.id
-    if (target) this.setActive(target)
-    else this._renderStrip()
   }
 
   // --- Internals ---
@@ -374,46 +328,15 @@ export class TabManager {
     paneEl.dataset.tabId = id
     this.trackEl.appendChild(paneEl)
 
-    const paneOpts = {
+    const pane = new TerminalPane(paneEl, {
       projectId: this.projectId,
       tabId: id,
       onStatusChange: (connected) => {
         if (this.activeId === id) this.onStatusChange(connected)
       },
-    }
+    })
 
-    // Claude tabs default to the raw PTY (xterm) renderer because the
-    // block renderer requires endpoints (/api/projects/:id/tabs/:tabId/history,
-    // /api/projects/:id/tabs/:tabId/queue) that aren't always reachable
-    // — e.g. on a worker process that predates the v1.3.0 endpoint
-    // surface, the block renderer can't load existing tab state and
-    // shows a blank pane. Users who want the block renderer can opt in
-    // via Settings → renderMode = 'block'.
-    // Codex stays on terminal-mode default; block was experimental.
-    const renderMode = (() => { try { return window.__nanocodeState?.renderMode || 'terminal' } catch { return 'terminal' } })()
-    const codexRenderMode = (() => { try { return window.__nanocodeState?.codexRenderMode || 'terminal' } catch { return 'terminal' } })()
-    const useClaudeRenderer = type === 'claude' && renderMode === 'block'
-    const useCodexRenderer = type === 'codex' && codexRenderMode === 'block'
-    // Synchronous default: PTY renderer. Block renderers are loaded
-    // lazily and swapped in once the module arrives. While the JS
-    // streams in, the placeholder TerminalPane keeps the WS attached
-    // so no terminal state is lost; we tear it down right before
-    // installing the block renderer on the same element.
-    let pane = new TerminalPane(paneEl, paneOpts)
     this.tabs.push({ id, label, type, pane, paneEl })
-
-    if (useClaudeRenderer || useCodexRenderer) {
-      const loader = useClaudeRenderer ? loadClaudeBlock() : loadCodexBlock()
-      loader.then((Cls) => {
-        const tab = this.tabs.find((t) => t.id === id)
-        if (!tab) return
-        try { tab.pane.dispose() } catch {}
-        paneEl.innerHTML = ''
-        tab.pane = new Cls(paneEl, paneOpts)
-      }).catch((err) => {
-        console.error('[tab-manager] failed to load block renderer:', err)
-      })
-    }
     // Track grew; keep the visible position pinned to the active tab.
     this._syncTrackPosition({ noAnim: true })
   }

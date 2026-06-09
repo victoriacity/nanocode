@@ -16,13 +16,7 @@
  *   - hljs       (UMD)
  */
 
-// Explorer tree-refresh poll. 10s was hammering the worker (one parallel
-// GET /files per expanded directory on every tick — N=20 dirs ⇒ 20
-// requests every 10s ⇒ 2 req/s baseline JUST for the explorer). On a
-// worker already busy streaming PTY output from active agent tabs, this
-// stole accept-queue slots from /ws/terminal and / api/* that need them
-// more. 60s gives the same eventual-consistency UX but with 6× less load.
-const POLL_INTERVAL_MS = 60_000
+const POLL_INTERVAL_MS = 10_000
 const POLL_DIR_CAP = 50
 const STORAGE_PREFIX = 'explorer:'
 
@@ -1033,122 +1027,6 @@ export function createExplorer(container, projectId) {
       container.removeEventListener('drop', onDrop)
       container.innerHTML = ''
       container.classList.remove('explorer', 'dragging')
-    },
-    /**
-     * Feature 2: open a file path programmatically — called when user clicks
-     * a path link in a chat bubble (nanocode:open-in-explorer event).
-     *
-     * The path may be:
-     *   - An absolute path starting with / (cross-project or codex_work)
-     *   - A ~/... path (expand to home-root absolute path)
-     *   - A repo-relative path like "server/index.js"
-     *
-     * Absolute-path strategy (method C):
-     *   1. Fetch all projects; find one whose cwd is a prefix of the path.
-     *      If found, switch to that project then navigate to the relative path.
-     *   2. Otherwise, pass the absolute path directly to the backend — the server
-     *      will sandbox it against the home root (/storage/home/zhiningjiao).
-     *      The file is previewed using the current project's API endpoint, which
-     *      now accepts absolute paths via resolveWithFallback().
-     *
-     * Relative paths: navigate the existing tree as before.
-     */
-    async openPath(rawPath) {
-      if (remote || cancelled) return
-      let filePath = rawPath
-
-      // Expand ~/ to absolute home path
-      if (filePath.startsWith('~/')) {
-        filePath = '/storage/home/zhiningjiao/' + filePath.slice(2)
-      }
-
-      // ── Absolute path handling ────────────────────────────────────────────
-      if (filePath.startsWith('/')) {
-        // Try to find a project whose cwd covers this path
-        let projects = []
-        try {
-          projects = await fetch('/api/projects').then((r) => r.json())
-        } catch {}
-
-        let bestProject = null
-        let bestRelPath = null
-        for (const p of projects) {
-          if (!p.cwd || p.ssh_host) continue
-          const cwd = p.cwd.endsWith('/') ? p.cwd : p.cwd + '/'
-          if (filePath.startsWith(cwd)) {
-            const rel = filePath.slice(cwd.length)
-            // Prefer the project with the longest matching cwd (most specific)
-            if (!bestProject || p.cwd.length > bestProject.cwd.length) {
-              bestProject = p
-              bestRelPath = rel
-            }
-          }
-        }
-
-        if (bestProject && bestRelPath !== null && bestProject.id === project) {
-          // Same project: navigate within the existing tree (highlight + preview).
-          // If the path belongs to a *different* project, skip the tree nav entirely
-          // so we never dispatch switch-project and never change the user's working context.
-          const parts = bestRelPath.split('/').filter(Boolean)
-          if (!parts.length) return
-          try {
-            let current = ''
-            for (let i = 0; i < parts.length - 1; i++) {
-              const next = current ? `${current}/${parts[i]}` : parts[i]
-              if (!expanded.has(next)) {
-                await expandDir(next)
-                if (cancelled) return
-              }
-              current = next
-            }
-            const parentDir = parts.slice(0, -1).join('/')
-            const siblings = entriesByDir.get(parentDir) || []
-            const match = siblings.find((e) => e.path === bestRelPath || e.name === parts[parts.length - 1])
-            if (match) {
-              renderTree()
-              await selectFile(match.path, match.size || 0, { force: true })
-              return
-            }
-          } catch {}
-        }
-
-        // Fallback: pass the absolute path directly — backend handles home-root sandbox
-        // The file is loaded as if selectedPath were the absolute path.
-        // Tree won't highlight it (it's outside cwd) but preview will work.
-        try {
-          await selectFile(filePath, 0, { force: true })
-        } catch {}
-        return
-      }
-
-      // ── Relative path: navigate the tree ─────────────────────────────────
-      const parts = filePath.split('/').filter(Boolean)
-      if (!parts.length) return
-
-      try {
-        let current = ''
-        for (let i = 0; i < parts.length - 1; i++) {
-          const next = current ? `${current}/${parts[i]}` : parts[i]
-          if (!expanded.has(next)) {
-            await expandDir(next)
-            if (cancelled) return
-          }
-          current = next
-        }
-        const parentDir = parts.slice(0, -1).join('/')
-        const siblings = entriesByDir.get(parentDir) || entriesByDir.get('') || []
-        const match = siblings.find((e) => e.path === filePath || e.name === parts[parts.length - 1])
-        if (match) {
-          renderTree()
-          await selectFile(match.path, match.size || 0, { force: true })
-          return
-        }
-      } catch {}
-
-      // Last resort: pass as-is
-      try {
-        await selectFile(filePath, 0, { force: true })
-      } catch {}
     },
     async switchProject(newProjectId) {
       persist()
