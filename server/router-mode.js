@@ -199,12 +199,34 @@ export function startRouterMode({
   //
   // The worker only needs to handle /api/* and /ws/* from here on.
   const ASSET_DIR = path.join(ROOT, 'public')
+
+  // One-shot HTTP-cache flush. Browsers that fetched assets during
+  // the v1.3.4 window have them pinned with max-age=604800 (7 days)
+  // and ignore the no-cache header on already-cached entries.
+  // Clear-Site-Data: "cache" tells the browser to drop its HTTP
+  // cache for this origin on the next response. Gated by a cookie
+  // so each browser sees it exactly once — next load is fresh,
+  // every subsequent load is normal. Only fires on the index.html
+  // load (else we'd loop the bust on every asset fetch).
+  const CACHE_BUST_COOKIE = 'nano_cache_bust_v2'
+  app.use((req, res, next) => {
+    const urlPath = (req.url || '').split('?')[0]
+    if (urlPath !== '/' && urlPath !== '/index.html') return next()
+    const cookies = String(req.headers['cookie'] || '')
+    if (cookies.includes(`${CACHE_BUST_COOKIE}=1`)) return next()
+    res.setHeader('Clear-Site-Data', '"cache"')
+    const prior = res.getHeader('set-cookie')
+    const priorArr = Array.isArray(prior) ? prior : prior ? [prior] : []
+    res.setHeader('set-cookie', [
+      ...priorArr,
+      `${CACHE_BUST_COOKIE}=1; Path=/; Max-Age=31536000; SameSite=Lax`,
+    ])
+    next()
+  })
+
   // App code (/js/*, /style.css, /index.html) must revalidate on every
   // page load so a deploy reaches browsers without a hard-refresh.
-  // ETag-based 304 Not Modified makes this cheap. (Previously a 7-day
-  // max-age meant client fixes took up to a week to propagate, e.g.
-  // v1.3.3's renderMode default fix not showing up in the settings
-  // panel.)
+  // ETag-based 304 Not Modified makes this cheap.
   app.use(express.static(ASSET_DIR, {
     etag: true,
     lastModified: true,
