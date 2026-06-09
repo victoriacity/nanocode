@@ -147,6 +147,23 @@ export function startRouterMode({
   // Health check is unauthenticated.
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))
 
+  // Public-by-design assets — served by the router itself, BEFORE
+  // auth, because the browser fetches them without credentials:
+  //   - <link rel="manifest"> is no-cors per spec (no cookie sent)
+  //   - <link rel="icon">  also no-cors
+  //   - @font-face URLs skip cookies on cross-origin and some same-
+  //     origin paths depending on the browser
+  // Without this, those fetches hit the auth middleware, get 302 →
+  // HTML body of /login, and the browser surfaces "Manifest: Syntax
+  // error" / font-load failures / 502 in the console. These files
+  // are intentionally public — none of them leak session state.
+  const PUBLIC_DIR = path.join(ROOT, 'public')
+  const publicAssetOpts = { maxAge: '7d', fallthrough: false }
+  for (const file of ['manifest.json', 'favicon.svg', 'favicon.ico']) {
+    app.get('/' + file, (_req, res) => res.sendFile(path.join(PUBLIC_DIR, file)))
+  }
+  app.use('/fonts', express.static(path.join(PUBLIC_DIR, 'fonts'), publicAssetOpts))
+
   // Auth middleware for everything else.
   const auth = createAuthMiddleware({
     sessionStore: sessions,
