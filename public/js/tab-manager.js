@@ -365,13 +365,17 @@ export class TabManager {
       },
     }
 
-    // Claude tabs use a DOM block renderer by default (rich text, mobile-friendly).
-    // If the global renderMode setting is 'terminal', use raw PTY instead.
-    // Codex tabs: separate codexRenderMode setting, defaults to 'terminal' (xterm raw).
-    // Set codexRenderMode to 'block' in Settings to opt into CodexBlockRenderer (experimental).
-    const renderMode = (() => { try { return window.__nanocodeState?.renderMode || 'block' } catch { return 'block' } })()
+    // Claude tabs default to the raw PTY (xterm) renderer because the
+    // block renderer requires endpoints (/api/projects/:id/tabs/:tabId/history,
+    // /api/projects/:id/tabs/:tabId/queue) that aren't always reachable
+    // — e.g. on a worker process that predates the v1.3.0 endpoint
+    // surface, the block renderer can't load existing tab state and
+    // shows a blank pane. Users who want the block renderer can opt in
+    // via Settings → renderMode = 'block'.
+    // Codex stays on terminal-mode default; block was experimental.
+    const renderMode = (() => { try { return window.__nanocodeState?.renderMode || 'terminal' } catch { return 'terminal' } })()
     const codexRenderMode = (() => { try { return window.__nanocodeState?.codexRenderMode || 'terminal' } catch { return 'terminal' } })()
-    const useClaudeRenderer = type === 'claude' && renderMode !== 'terminal'
+    const useClaudeRenderer = type === 'claude' && renderMode === 'block'
     const useCodexRenderer = type === 'codex' && codexRenderMode === 'block'
     let pane
     if (useClaudeRenderer) {

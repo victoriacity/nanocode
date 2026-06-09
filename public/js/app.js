@@ -476,7 +476,7 @@ const codexRenderModeSaveBtn = document.getElementById('codex-render-mode-save-b
 const codexRenderModeStatusEl = document.getElementById('codex-render-mode-status')
 
 function loadRenderModeSettings(serverSettings) {
-  const mode = (serverSettings?.renderMode) || 'block'
+  const mode = (serverSettings?.renderMode) || 'terminal'
   const radios = renderModeGroup?.querySelectorAll('input[name="render-mode"]')
   if (radios) {
     for (const radio of radios) radio.checked = radio.value === mode
