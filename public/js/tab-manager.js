@@ -10,6 +10,8 @@
  */
 
 import { TerminalPane } from './terminal-pane.js'
+import { ClaudeBlockRenderer } from './claude-block-renderer.js'
+import { CodexBlockRenderer } from './codex-block-renderer.js'
 import { fetchTabs, createTab, deleteTab, patchTab } from './api.js'
 
 const ACTIVE_KEY_PREFIX = 'activeTab:'
@@ -311,13 +313,40 @@ export class TabManager {
       if (this.tabs.length) this.setActive(this.tabs[0].id)
       else this._renderStrip()
     } else if (!this.activeId && this.tabs.length) {
-      // First-time activation: prefer the last-active for this device.
+      // First-time activation: prefer the last-active for this device, or the
+      // most-recently-active claude tab (by jsonl mtime) for cross-port resume.
       const remembered = loadActiveId(this.projectId)
-      const target = (remembered && serverById.has(remembered)) ? remembered : this.tabs[0].id
-      this.setActive(target)
+      if (remembered && serverById.has(remembered)) {
+        this.setActive(remembered)
+      } else {
+        // No remembered tab for this device: auto-select the most recently active
+        // claude tab by querying the server (jsonl mtime). Falls back to tabs[0].
+        this._autoSelectMostRecentClaudeTab(serverById)
+      }
     } else {
       this._renderStrip()
     }
+  }
+
+  /**
+   * Query /api/projects/:id/most-recent-claude-tab and activate that tab.
+   * Falls back to tabs[0] if the API fails or returns null.
+   * Only called on first-time activation (no remembered tab for this device).
+   */
+  async _autoSelectMostRecentClaudeTab(serverById) {
+    let tabId = null
+    try {
+      const resp = await fetch(`/api/projects/${this.projectId}/most-recent-claude-tab`)
+      if (resp.ok) {
+        const data = await resp.json()
+        tabId = data?.tabId || null
+      }
+    } catch {}
+
+    // Pick the API result if it's valid, else fall back to first tab
+    const target = (tabId && serverById.has(tabId)) ? tabId : this.tabs[0]?.id
+    if (target) this.setActive(target)
+    else this._renderStrip()
   }
 
   // --- Internals ---
@@ -328,13 +357,30 @@ export class TabManager {
     paneEl.dataset.tabId = id
     this.trackEl.appendChild(paneEl)
 
-    const pane = new TerminalPane(paneEl, {
+    const paneOpts = {
       projectId: this.projectId,
       tabId: id,
       onStatusChange: (connected) => {
         if (this.activeId === id) this.onStatusChange(connected)
       },
-    })
+    }
+
+    // Claude tabs use a DOM block renderer by default (rich text, mobile-friendly).
+    // If the global renderMode setting is 'terminal', use raw PTY instead.
+    // Codex tabs: separate codexRenderMode setting, defaults to 'terminal' (xterm raw).
+    // Set codexRenderMode to 'block' in Settings to opt into CodexBlockRenderer (experimental).
+    const renderMode = (() => { try { return window.__nanocodeState?.renderMode || 'block' } catch { return 'block' } })()
+    const codexRenderMode = (() => { try { return window.__nanocodeState?.codexRenderMode || 'terminal' } catch { return 'terminal' } })()
+    const useClaudeRenderer = type === 'claude' && renderMode !== 'terminal'
+    const useCodexRenderer = type === 'codex' && codexRenderMode === 'block'
+    let pane
+    if (useClaudeRenderer) {
+      pane = new ClaudeBlockRenderer(paneEl, paneOpts)
+    } else if (useCodexRenderer) {
+      pane = new CodexBlockRenderer(paneEl, paneOpts)
+    } else {
+      pane = new TerminalPane(paneEl, paneOpts)
+    }
 
     this.tabs.push({ id, label, type, pane, paneEl })
     // Track grew; keep the visible position pinned to the active tab.

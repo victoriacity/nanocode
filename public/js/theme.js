@@ -1,13 +1,13 @@
 /**
- * Theme manager — light / dark.
+ * Theme manager — dark (preferred default) / light.
  *
  * Resolves the initial theme from:
- *   1. localStorage.nanocodeTheme  ("light" | "dark")
+ *   1. localStorage.nanocodeTheme  ("dark" | "light")
  *   2. window.matchMedia('(prefers-color-scheme: dark)') — OS preference
- *   3. light (the akari default)
+ *   3. dark (our preferred default)
  *
- * Applies via `<body data-theme="dark">`; all CSS tokens are scoped on
- * that attribute. Notifies listeners (e.g. xterm panes) via a custom
+ * Applies via `<html data-theme="dark">` (upstream CSS convention).
+ * Notifies listeners (e.g. xterm panes) via a custom
  * 'nanocode:theme' event on document.
  */
 
@@ -18,8 +18,8 @@ function detectInitial() {
     const stored = localStorage.getItem(STORAGE_KEY)
     if (stored === 'dark' || stored === 'light') return stored
   } catch {}
-  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark'
-  return 'light'
+  // No stored preference → always default to dark regardless of OS.
+  return 'dark'
 }
 
 let current = detectInitial()
@@ -27,11 +27,9 @@ applyTheme(current)
 
 function applyTheme(theme) {
   current = theme
-  // Set on <html> to match the pre-paint script in index.html (avoids
-  // a paint flash if the document body isn't ready yet).
   const root = document.documentElement
-  if (theme === 'dark') root.setAttribute('data-theme', 'dark')
-  else root.removeAttribute('data-theme')
+  // Always set the attribute explicitly so [data-theme="light"] CSS rules fire.
+  root.setAttribute('data-theme', theme === 'dark' ? 'dark' : 'light')
 }
 
 export function getTheme() {
