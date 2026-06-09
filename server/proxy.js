@@ -31,16 +31,16 @@ import http from 'node:http'
 // keepAlive=true reuses warm sockets — no thundering herd. maxSockets
 // caps the worker's concurrent inbound at a value its accept queue can
 // drain comfortably. maxFreeSockets keeps the pool warm between pages.
-// `timeout` MUST be shorter than the worker's server.keepAliveTimeout
-// (Node + Express default: 5s). Otherwise the worker silently closes
-// idle sockets while the agent still considers them fresh, the next
-// request writes to a dead socket and gets ECONNRESET. With 4s here
-// the agent always reaps first, the next request opens a fresh socket,
-// and no ECONNRESET escapes the proxy layer.
+// Keep-alive pool, with timeout shorter than the worker's default
+// keepAliveTimeout (5 s) so the agent reaps idle sockets BEFORE the
+// worker silently closes them. The combination of keepAlive=true +
+// 4 s reaping + retry-on-ECONNRESET makes 99%+ of bursts succeed
+// without re-handshakes pounding the worker's accept queue.
 //
-// On worker code that's been updated to set a longer keepAliveTimeout
-// (recommended: 120s), this 4s is still safe — it just means the pool
-// recycles a little more often than strictly necessary.
+// We tried keepAlive=false to eliminate stale-socket races entirely;
+// it backfired under the user's actual load (many long-running PTYs
+// keeping the worker's event loop hot), where every fresh connect
+// adds accept-queue pressure the worker can't always drain in time.
 const agent = new http.Agent({
   keepAlive: true,
   maxSockets: 64,
