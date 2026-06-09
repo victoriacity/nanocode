@@ -147,6 +147,23 @@ export function startRouterMode({
   // Health check is unauthenticated.
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))
 
+  // Public-by-design assets — served by the router itself, BEFORE
+  // auth, because the browser fetches them without credentials:
+  //   - <link rel="manifest"> is no-cors per spec (no cookie sent)
+  //   - <link rel="icon">  also no-cors
+  //   - @font-face URLs skip cookies on cross-origin and some same-
+  //     origin paths depending on the browser
+  // Without this, those fetches hit the auth middleware, get 302 →
+  // HTML body of /login, and the browser surfaces "Manifest: Syntax
+  // error" / font-load failures / 502 in the console. These files
+  // are intentionally public — none of them leak session state.
+  const PUBLIC_DIR = path.join(ROOT, 'public')
+  const publicAssetOpts = { maxAge: '7d', fallthrough: false }
+  for (const file of ['manifest.json', 'favicon.svg', 'favicon.ico']) {
+    app.get('/' + file, (_req, res) => res.sendFile(path.join(PUBLIC_DIR, file)))
+  }
+  app.use('/fonts', express.static(path.join(PUBLIC_DIR, 'fonts'), publicAssetOpts))
+
   // Auth middleware for everything else.
   const auth = createAuthMiddleware({
     sessionStore: sessions,
@@ -171,7 +188,50 @@ export function startRouterMode({
     res.json({ uid: req.user.uid, username: req.user.username })
   })
 
+  // Static client assets — served by the router directly, after auth,
+  // BEFORE the worker proxy. Critical for resilience: when a worker
+  // process is overloaded (e.g. PTYs streaming heavy TUI redraws),
+  // its accept queue stalls and any proxied request gets 502. By
+  // serving every static file from the router we keep the cold-load
+  // shape (HTML, CSS, JS, vendor libs, fonts, images) decoupled from
+  // worker health — a stuck worker no longer means "markdown lost"
+  // or "xterm.js failed to load" or any other LCP-blocking 502.
+  //
+  // The worker only needs to handle /api/* and /ws/* from here on.
+  const ASSET_DIR = path.join(ROOT, 'public')
+  // App code (/js/*, /style.css, /index.html) must revalidate on every
+  // page load so a deploy reaches browsers without a hard-refresh.
+  // ETag-based 304 Not Modified makes this cheap. (Previously a 7-day
+  // max-age meant client fixes took up to a week to propagate, e.g.
+  // v1.3.3's renderMode default fix not showing up in the settings
+  // panel.)
+  app.use(express.static(ASSET_DIR, {
+    etag: true,
+    lastModified: true,
+    cacheControl: true,
+    maxAge: 0,
+    setHeaders(res) {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate')
+    },
+  }))
+  // Vendor libs (node_modules/* and public/vendor/*) are content-
+  // versioned by package.json — no revalidation needed; cache hard.
+  const VENDOR_MAP = {
+    '/vendor/xterm': 'node_modules/@xterm/xterm',
+    '/vendor/xterm-addon-fit': 'node_modules/@xterm/addon-fit',
+    '/vendor/xterm-addon-web-links': 'node_modules/@xterm/addon-web-links',
+    '/vendor/marked': 'node_modules/marked/lib',
+    '/vendor/dompurify': 'node_modules/dompurify/dist',
+    '/vendor/highlight': 'public/vendor/highlight',
+    '/vendor/three': 'node_modules/three',
+  }
+  for (const [route, sub] of Object.entries(VENDOR_MAP)) {
+    app.use(route, express.static(path.join(ROOT, sub), { maxAge: '365d', immutable: true }))
+  }
+
   // All remaining traffic proxies to the user's worker.
+  // Static files have been consumed above; only /api/*, dynamic routes
+  // and anything not on disk reaches here.
   app.use((req, res) => {
     // Treat every proxied request as activity for the worker idle reaper,
     // so an in-use worker doesn't get evicted on a fixed wall-clock timer.

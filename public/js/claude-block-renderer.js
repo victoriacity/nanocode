@@ -1,0 +1,2124 @@
+/**
+ * ClaudeBlockRenderer (stream-json edition)
+ *
+ * Replaces the PTY/ANSI-based renderer. The server now speaks
+ * `{type:'claude-event', event}` line-delimited JSON (claude CLI
+ * --output-format=stream-json). No ANSI stripping, no TUI inference.
+ *
+ * Public API mirrors TerminalPane:
+ *   new ClaudeBlockRenderer(container, { projectId, tabId, onStatusChange })
+ *   .sendInputWithEcho(text)   — sends user turn + echoes prompt block
+ *   .sendRaw(data)             — only Ctrl+C / Ctrl+L forwarded
+ *   .fitAddon                  — stub { fit: () => {} }
+ *   .dispose()
+ *
+ * WS protocol (to server):
+ *   {type:'attach', projectId, sessionType:'bash', tabId, cols:200, rows:50}
+ *   {type:'claude-input', text:'...'} — user turn
+ *   {type:'ping', id}
+ *
+ * WS protocol (from server):
+ *   {type:'claude-event', event:{type:'system'|'assistant'|'partial_message'|'result'|'rate_limit_event',...}}
+ *   {type:'exit', exitCode}
+ *   {type:'error', error}
+ *   {type:'pong', id}
+ */
+
+import {
+  buildToolResultHtml,
+  createSkillLoadBlock,
+  createStandaloneToolResultBlock,
+  createSystemBlock,
+  createTextBlock,
+  createThinkingBlock,
+  createToolUseBlock,
+  createUserBlock,
+} from './claude-block-renderer/dom-render.js'
+import { ReplayCache } from './claude-block-renderer/replay-cache.js'
+import { pairToolResult, stampToolUseIdentity } from './claude-block-renderer/tool-result-pair.js'
+
+// ── WS constants ──────────────────────────────────────────────────────────────
+const WS_PATH = '/ws/terminal'
+const BACKOFF_BASE = 500
+const BACKOFF_MAX = 10_000
+const PING_INTERVAL_MS = 5000
+
+// ── Lazy history loading ───────────────────────────────────────────────────────
+// Initial replay: only render the last N events to keep DOM lean.
+// "Load more" prepends another HISTORY_PAGE events when user scrolls to top.
+// Raised from 50 → 200 to reduce the "records disappeared" perception when
+// the user returns to nanocode after switching tabs (bfcache miss / page reload).
+const INITIAL_HISTORY_BLOCKS = 200
+const HISTORY_PAGE_SIZE = 50
+
+// ── P1-1: Simple line-level diff for Edit/Write tool rendering ────────────────
+//
+// Produces an array of {type:'equal'|'removed'|'added', line} objects.
+// Uses LCS-based diff (Myers-style via DP) for small files; falls back to
+// a simpler naive diff when files are very large to keep it fast.
+function computeLineDiff(oldText, newText) {
+  const oldLines = oldText.split('\n')
+  const newLines = newText.split('\n')
+
+  // For very large diffs (>500 lines each), use a simple "remove all + add all" fallback
+  if (oldLines.length > 500 || newLines.length > 500) {
+    return [
+      ...oldLines.map((line) => ({ type: 'removed', line })),
+      ...newLines.map((line) => ({ type: 'added', line })),
+    ]
+  }
+
+  // Patience / DP LCS diff
+  const m = oldLines.length
+  const n = newLines.length
+
+  // Build LCS table
+  const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1))
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      if (oldLines[i] === newLines[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+  }
+
+  // Trace back
+  const result = []
+  let i = 0, j = 0
+  while (i < m || j < n) {
+    if (i < m && j < n && oldLines[i] === newLines[j]) {
+      result.push({ type: 'equal', line: oldLines[i] })
+      i++; j++
+    } else if (j < n && (i >= m || dp[i][j + 1] >= dp[i + 1][j])) {
+      result.push({ type: 'added', line: newLines[j] })
+      j++
+    } else {
+      result.push({ type: 'removed', line: oldLines[i] })
+      i++
+    }
+  }
+  return result
+}
+
+/**
+ * Render an Edit tool input as a two-column diff panel (red/green lines).
+ * Returns HTML string.
+ */
+function renderEditDiff(filePath, oldString, newString) {
+  const diff = computeLineDiff(oldString || '', newString || '')
+
+  // Cap at 300 lines to avoid massive DOM
+  const MAX_DIFF_LINES = 300
+  let lines = diff
+  let truncated = false
+  if (diff.length > MAX_DIFF_LINES) {
+    lines = diff.slice(0, MAX_DIFF_LINES)
+    truncated = true
+  }
+
+  let rows = ''
+  for (const { type, line } of lines) {
+    const prefix = type === 'added' ? '+' : type === 'removed' ? '−' : ' '
+    const cls = type === 'added' ? 'cbr-diff-added' : type === 'removed' ? 'cbr-diff-removed' : 'cbr-diff-equal'
+    rows += `<div class="cbr-diff-line ${cls}"><span class="cbr-diff-gutter">${prefix}</span><span class="cbr-diff-text">${escHtml(line)}</span></div>`
+  }
+
+  const header = filePath
+    ? `<div class="cbr-diff-filepath">${escHtml(filePath)}</div>`
+    : ''
+
+  return (
+    `<div class="cbr-diff-wrap">` +
+    header +
+    `<div class="cbr-diff-body">${rows}</div>` +
+    (truncated ? `<div class="cbr-diff-truncated">… diff truncated (showing first ${MAX_DIFF_LINES} of ${diff.length} lines)</div>` : '') +
+    `</div>`
+  )
+}
+
+/**
+ * Render a Write tool input as a green "new file" preview.
+ * Returns HTML string.
+ */
+function renderWritePreview(filePath, content) {
+  const lines = (content || '').split('\n')
+  const MAX_LINES = 200
+  const truncated = lines.length > MAX_LINES
+  const displayLines = truncated ? lines.slice(0, MAX_LINES) : lines
+
+  let rows = ''
+  for (const line of displayLines) {
+    rows += `<div class="cbr-diff-line cbr-diff-added"><span class="cbr-diff-gutter">+</span><span class="cbr-diff-text">${escHtml(line)}</span></div>`
+  }
+
+  const header = filePath
+    ? `<div class="cbr-diff-filepath cbr-diff-filepath--new">new file: ${escHtml(filePath)}</div>`
+    : ''
+
+  return (
+    `<div class="cbr-diff-wrap">` +
+    header +
+    `<div class="cbr-diff-body">${rows}</div>` +
+    (truncated ? `<div class="cbr-diff-truncated">… truncated (showing first ${MAX_LINES} of ${lines.length} lines)</div>` : '') +
+    `</div>`
+  )
+}
+
+// ── P2-1: Tool icon map (inline 16×16 SVG, no external deps) ─────────────────
+const TOOL_ICONS = {
+  // Terminal / shell
+  Bash:        `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="18" rx="2"/><polyline points="8 10 12 14 16 10"/><line x1="8" y1="14" x2="16" y2="14"/></svg>`,
+  // File reading
+  Read:        `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>`,
+  // File editing / writing (pencil)
+  Edit:        `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`,
+  Write:       `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`,
+  MultiEdit:   `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`,
+  // Search / magnifier
+  WebSearch:   `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
+  WebFetch:    `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
+  // Grep / funnel filter
+  Grep:        `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>`,
+  // Glob / wildcard (asterisk)
+  Glob:        `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/><line x1="19.07" y1="4.93" x2="4.93" y2="19.07"/></svg>`,
+  LS:          `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>`,
+  // Todo / checklist
+  TodoWrite:   `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`,
+  TodoRead:    `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`,
+  // Agent / robot (subagent dispatch)
+  Task:        `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="12" y1="16" x2="12" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>`,
+  Agent:       `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="12" y1="16" x2="12" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>`,
+  TaskCreate:  `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="12" y1="16" x2="12" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>`,
+  // Notebook
+  NotebookRead:  `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>`,
+  NotebookEdit:  `<svg class="cbr-tool-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>`,
+}
+
+function getToolIcon(toolName) {
+  if (!toolName) return ''
+  return TOOL_ICONS[toolName] || ''
+}
+
+// ── Tool-block fold level ──────────────────────────────────────────────────────
+// Three levels (persisted in localStorage):
+//   'full'    — show tool name + full input/output content
+//   'header'  — show only the tool name header (block state)
+//   'line'    — collapse to a single thin line (default, Q4 answer C)
+//
+// Cycle order (Q2 answer A): full → header → line → full → …
+// Default is 'line' (most screen-efficient, user-requested).
+const TOOL_FOLD_KEY = 'cbr_tool_fold'
+const TOOL_FOLD_LEVELS = ['full', 'header', 'line']
+
+// 2-state click cycle: full ↔ line (header accessible via settings panel only)
+const TOOL_FOLD_CYCLE = { full: 'line', header: 'full', line: 'full' }
+
+function getToolFoldLevel() {
+  const v = localStorage.getItem(TOOL_FOLD_KEY)
+  // Default: 'line' (Q4 answer C — most screen-efficient)
+  return TOOL_FOLD_LEVELS.includes(v) ? v : 'line'
+}
+
+/**
+ * Cycle a tool block's data-fold attribute through 2 states on click.
+ * full → line → full → …
+ * Header state is still reachable via settings panel only.
+ * Works for both .cbr-block-tool and .cbr-block-tool-result articles.
+ */
+function cycleToolFold(article) {
+  const cur = article.getAttribute('data-fold') || getToolFoldLevel()
+  const next = TOOL_FOLD_CYCLE[cur] || 'full'
+  article.setAttribute('data-fold', next)
+}
+
+// ── Subagent visibility toggles ───────────────────────────────────────────────
+// Two independent booleans (persisted in localStorage):
+//   cbr_subagent_prompt  — show the message/prompt sent TO a subagent (default on)
+//   cbr_subagent_activity — show subagent internal activity (nested events, default off)
+const SUBAGENT_PROMPT_KEY = 'cbr_subagent_prompt'
+const SUBAGENT_ACTIVITY_KEY = 'cbr_subagent_activity'
+
+function getSubagentPromptVisible() {
+  const v = localStorage.getItem(SUBAGENT_PROMPT_KEY)
+  return v === null ? true : v !== 'false'
+}
+
+function setSubagentPromptVisible(val) {
+  localStorage.setItem(SUBAGENT_PROMPT_KEY, val ? 'true' : 'false')
+  // Apply immediately to all existing subagent-prompt blocks.
+  // Visibility only — fold state follows the global tool-fold setting.
+  document.querySelectorAll('.cbr-block-subagent-prompt').forEach((el) => {
+    el.style.display = val ? '' : 'none'
+  })
+  document.dispatchEvent(new CustomEvent('cbr:subagent-prompt-changed', { detail: { visible: val } }))
+}
+
+function getSubagentActivityVisible() {
+  const v = localStorage.getItem(SUBAGENT_ACTIVITY_KEY)
+  return v === null ? false : v === 'true'
+}
+
+function setSubagentActivityVisible(val) {
+  localStorage.setItem(SUBAGENT_ACTIVITY_KEY, val ? 'true' : 'false')
+  // Apply immediately to all existing subagent-activity blocks
+  document.querySelectorAll('.cbr-block-subagent-activity').forEach((el) => {
+    el.style.display = val ? '' : 'none'
+  })
+  document.dispatchEvent(new CustomEvent('cbr:subagent-activity-changed', { detail: { visible: val } }))
+}
+
+function setToolFoldLevel(level) {
+  if (!TOOL_FOLD_LEVELS.includes(level)) return
+  localStorage.setItem(TOOL_FOLD_KEY, level)
+  // Apply to all currently-rendered tool blocks in the page
+  document.querySelectorAll('.cbr-block-tool, .cbr-block-tool-result').forEach((el) => {
+    applyToolFold(el, level)
+  })
+  document.dispatchEvent(new CustomEvent('cbr:tool-fold-changed', { detail: { level } }))
+}
+
+function applyToolFold(el, level) {
+  el.setAttribute('data-fold', level || getToolFoldLevel())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+// N16 fix: strip Claude's internal XML system-caveat tags before rendering.
+// These tags (e.g. <local-command-caveat>, <function_calls>) are implementation
+// details that must never be shown raw to the user. We strip the full tag block
+// including its content; stripping only tags while keeping content makes the
+// text even more confusing.
+const XML_CAVEAT_TAGS = [
+  'local-command-caveat',
+  'antml:function_calls',
+  'function_calls',
+  'antml:invoke',
+  'antml:parameter',
+  'command-caveat',
+]
+function stripXmlCaveats(text) {
+  if (!text || !/</.test(text)) return text
+  let out = text
+  for (const tag of XML_CAVEAT_TAGS) {
+    // Strip complete <tag ...>...</tag> blocks (including content)
+    out = out.replace(new RegExp(`<${tag}(?:\\s[^>]*)?>.*?<\\/${tag}>`, 'gsi'), '')
+    // Strip self-closing <tag ... />
+    out = out.replace(new RegExp(`<${tag}(?:\\s[^>]*)?\\/?>`, 'gi'), '')
+  }
+  return out.trim()
+}
+
+// ── P3-1: Streaming code-block closing-backtick guard ─────────────────────────
+//
+// When streaming, marked.parse() on text with an unclosed ``` fence wraps
+// ALL remaining text inside the code block, causing layout chaos (giant
+// monospace block). We detect unclosed fences and omit them from the render
+// pass — the next chunk that closes the fence will trigger a proper render.
+//
+// Strategy (adapted from open-webui):
+//   Count the number of ``` fence openings that lack a closing partner.
+//   If the text ends "inside" a fence (odd fence count after splitting by ```),
+//   trim the text to just before the last unpaired opening fence for rendering.
+//   When rendering is frozen/final we always render the full text as-is.
+//
+// Returns { safe: string, truncated: boolean }
+function guardUnclosedFences(text) {
+  if (!text) return { safe: text, truncated: false }
+
+  // Split on ``` boundaries (triple backtick, possibly followed by a lang tag)
+  // We count opening vs closing fences:
+  //   A ``` at the START of a line is a fence delimiter.
+  //   Odd count means we're still inside a fence.
+  const lines = text.split('\n')
+  let fenceOpen = false
+  let lastFenceStart = -1  // char offset of the last unpaired ``` opening
+
+  let charOffset = 0
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (/^```/.test(line)) {
+      if (!fenceOpen) {
+        fenceOpen = true
+        lastFenceStart = charOffset
+      } else {
+        fenceOpen = false
+        lastFenceStart = -1
+      }
+    }
+    charOffset += line.length + 1  // +1 for the \n
+  }
+
+  if (fenceOpen && lastFenceStart > 0) {
+    // There is an unclosed fence — trim to just before it for streaming render
+    return { safe: text.slice(0, lastFenceStart).trimEnd(), truncated: true }
+  }
+  return { safe: text, truncated: false }
+}
+
+function renderMarkdown(text, { streaming = false } = {}) {
+  if (!text) return ''
+  text = stripXmlCaveats(text)
+  if (!text) return ''
+
+  // P3-1: for streaming renders, omit unclosed code fences to prevent layout chaos
+  let renderText = text
+  if (streaming) {
+    const { safe } = guardUnclosedFences(text)
+    renderText = safe || text  // fall back to full text if safe is empty
+  }
+
+  try {
+    if (window.marked && window.DOMPurify) {
+      let html = window.DOMPurify.sanitize(window.marked.parse(renderText))
+      // Open all markdown-rendered links in a new tab. Without this, clicking a
+      // link (e.g. a viewer URL in an assistant response) navigates the nanocode
+      // page away in the same tab — reloading the app and losing in-flight messages
+      // that haven't been flushed to the session jsonl yet.
+      // attachPathAndUrlHandlers() already handles bare-URL text nodes, but it
+      // explicitly skips nodes inside existing <a> elements, so marked-rendered
+      // links would be missed without this post-processing step.
+      html = html.replace(/<a /g, '<a target="_blank" rel="noopener noreferrer" ')
+      return html
+    }
+  } catch {}
+  // Minimal fallback
+  const lines = renderText.split('\n')
+  let out = ''
+  for (const line of lines) {
+    const safe = line
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+    if (/^#{1,6}\s/.test(line)) {
+      const level = line.match(/^(#+)/)[1].length
+      out += `<h${level} class="cbr-h">${safe.replace(/^#+\s*/, '')}</h${level}>`
+    } else if (line.trim() === '') {
+      out += '<br>'
+    } else {
+      out += `<p>${safe}</p>`
+    }
+  }
+  return out
+}
+
+function renderCode(code, lang) {
+  let inner = ''
+  try {
+    if (window.hljs && lang) {
+      inner = window.hljs.highlight(code, { language: lang, ignoreIllegals: true }).value
+    } else if (window.hljs) {
+      inner = window.hljs.highlightAuto(code).value
+    }
+  } catch {}
+  if (!inner) inner = escHtml(code)
+  const langLabel = lang ? `<span class="cbr-code-lang">${escHtml(lang)}</span>` : ''
+  return (
+    `<div class="cbr-code-wrap">` +
+    `<div class="cbr-code-header">${langLabel}<button class="cbr-copy-btn" aria-label="Copy code">Copy</button></div>` +
+    `<pre class="cbr-pre"><code class="cbr-code">${inner}</code></pre>` +
+    `</div>`
+  )
+}
+
+function attachCopyHandlers(el) {
+  el.querySelectorAll('.cbr-copy-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const pre = btn.closest('.cbr-code-wrap')?.querySelector('pre')
+      const text = pre ? pre.textContent : el.textContent
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent
+        btn.textContent = 'Copied!'
+        setTimeout(() => { btn.textContent = orig }, 1500)
+      }).catch(() => {})
+    })
+  })
+}
+
+// ── Feature 2: Clickable file paths ──────────────────────────────────────────
+//
+// Conservative regex: matches absolute /storage/... or ~/... paths, or
+// relative repo paths like "server/index.js" (must have at least one "/" and
+// end with a known extension or be a file-like segment with no spaces).
+//
+// Rules to avoid false positives:
+//   - Must start with / or ~/ or contain an interior "/" (not just bare words)
+//   - Absolute paths must start with /storage/ or /home/ or ~/
+//   - Relative paths must contain at least one "/" and end with a word char or known ext
+//   - Must NOT be wrapped in an existing <a> (handled by DOM walk below)
+//   - Max length guard: skip if segment > 300 chars
+//
+// This regex is intentionally NOT applied to markdown-rendered HTML (which
+// marked already handles links). It is applied to raw text nodes only.
+
+// Path regex rules:
+//   - Absolute: must start with /storage/, /home/, or ~/
+//     Matches word chars, dots, hyphens, slashes — no spaces — excluding trailing punctuation
+//   - Relative: identifier/path/file.ext — NO spaces, at least one slash,
+//     must end with a known-ish extension (2-10 chars alpha), NOT preceded by :// (avoid
+//     matching inside URLs twice), and NOT pure numbers/dots (version fractions)
+// Trailing punctuation (.,;:!) is excluded via negative lookahead.
+const PATH_RE = /(?:(?:\/(?:storage|home)\/[^\s,;:!?()\[\]"'<>]+)|(?:~\/[^\s,;:!?()\[\]"'<>]+)|(?<![:/])(?:[a-zA-Z][a-zA-Z0-9_.-]*(?:\/[a-zA-Z0-9_.+-]+)+\.[a-zA-Z]{2,10})(?=\s|$|[,;:!?()\[\]"'<>]))/g
+
+// URL regex: bare http(s):// links not already inside an <a>
+const URL_RE = /https?:\/\/[^\s"'<>[\]()]+[^\s"'<>[\]().,;:!?]/g
+
+/**
+ * Walk text nodes inside `root`, find file paths and bare URLs, and replace
+ * them with clickable elements. Skips nodes already inside <a>, <pre>, <code>.
+ */
+function attachPathAndUrlHandlers(root) {
+  // Collect text nodes that are not inside <a>, <pre>, or <code>
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      let p = node.parentElement
+      while (p && p !== root) {
+        const tag = p.tagName.toLowerCase()
+        if (tag === 'a' || tag === 'pre' || tag === 'code') return NodeFilter.FILTER_REJECT
+        p = p.parentElement
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+
+  const textNodes = []
+  let node
+  while ((node = walker.nextNode())) textNodes.push(node)
+
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue
+    if (!text) continue
+
+    // Quick pre-check: does this text contain anything interesting?
+    if (!/https?:\/\//.test(text) && !/(\/storage\/|\/home\/|~\/|\w+\/\w+\.\w{1,10})/.test(text)) continue
+
+    // Build a combined regex pass: find all URLs and paths
+    // Strategy: find all matches with their positions, sort by index,
+    // split the text into literal + clickable parts.
+    const matches = []
+    let m
+
+    // Reset lastIndex
+    URL_RE.lastIndex = 0
+    PATH_RE.lastIndex = 0
+
+    while ((m = URL_RE.exec(text)) !== null) {
+      matches.push({ type: 'url', start: m.index, end: m.index + m[0].length, value: m[0] })
+    }
+    URL_RE.lastIndex = 0
+
+    while ((m = PATH_RE.exec(text)) !== null) {
+      if (m[0].length > 300) continue
+      matches.push({ type: 'path', start: m.index, end: m.index + m[0].length, value: m[0] })
+    }
+    PATH_RE.lastIndex = 0
+
+    if (!matches.length) continue
+
+    // Sort by start position, then remove overlaps
+    matches.sort((a, b) => a.start - b.start)
+    const deduped = []
+    let lastEnd = 0
+    for (const match of matches) {
+      if (match.start < lastEnd) continue  // overlaps previous match — skip
+      deduped.push(match)
+      lastEnd = match.end
+    }
+
+    if (!deduped.length) continue
+
+    // Build a document fragment replacing matched spans with elements
+    const frag = document.createDocumentFragment()
+    let pos = 0
+    for (const match of deduped) {
+      if (match.start > pos) {
+        frag.appendChild(document.createTextNode(text.slice(pos, match.start)))
+      }
+      if (match.type === 'url') {
+        const a = document.createElement('a')
+        a.href = match.value
+        a.target = '_blank'
+        a.rel = 'noopener noreferrer'
+        a.textContent = match.value
+        a.className = 'cbr-autolink-url'
+        frag.appendChild(a)
+      } else {
+        const span = document.createElement('span')
+        span.className = 'cbr-path-link'
+        span.textContent = match.value
+        span.title = 'Open in explorer: ' + match.value
+        span.dataset.path = match.value
+        span.addEventListener('click', (e) => {
+          e.stopPropagation()
+          document.dispatchEvent(new CustomEvent('nanocode:open-in-explorer', {
+            detail: { path: match.value },
+            bubbles: true,
+          }))
+        })
+        frag.appendChild(span)
+      }
+      pos = match.end
+    }
+    if (pos < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(pos)))
+    }
+
+    textNode.parentNode.replaceChild(frag, textNode)
+  }
+}
+
+// ── Main class ────────────────────────────────────────────────────────────────
+
+export class ClaudeBlockRenderer {
+  constructor(container, opts = {}) {
+    this.container = container
+    this.projectId = opts.projectId
+    this.tabId = opts.tabId
+    this.onStatusChange = opts.onStatusChange || (() => {})
+
+    this.fitAddon = { fit: () => {} }
+
+    container.classList.add('cbr-container')
+    this._scroll = document.createElement('div')
+    this._scroll.className = 'cbr-scroll'
+    container.appendChild(this._scroll)
+
+    // ── Scroll-to-bottom button ────────────────────────────────────────────────
+    // Floats over the scroll area; appears when the user is not at the bottom.
+    this._scrollBtn = document.createElement('button')
+    this._scrollBtn.className = 'cbr-scroll-to-bottom'
+    this._scrollBtn.setAttribute('aria-label', 'Scroll to bottom')
+    this._scrollBtn.title = 'Scroll to bottom'
+    this._scrollBtn.innerHTML =
+      `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">` +
+      `<polyline points="6 9 12 15 18 9"/></svg>`
+    this._scrollBtn.addEventListener('click', () => {
+      // User explicitly asked to go to bottom — resume auto-scroll
+      this._userScrolledUp = false
+      this._scroll.scrollTo({ top: this._scroll.scrollHeight, behavior: 'smooth' })
+    })
+    container.appendChild(this._scrollBtn)
+
+    // Smart auto-scroll state: true when the user has scrolled away from the bottom
+    this._userScrolledUp = false
+
+    // Show/hide the button AND track user scroll intent (debounced via rAF)
+    let _scrollRafPending = false
+    this._scroll.addEventListener('scroll', () => {
+      if (_scrollRafPending) return
+      _scrollRafPending = true
+      requestAnimationFrame(() => {
+        _scrollRafPending = false
+        const s = this._scroll
+        const atBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 40
+        this._userScrolledUp = !atBottom
+        this._updateScrollBtn()
+      })
+    }, { passive: true })
+
+    this._ws = null
+    this._exited = false
+    this._reconnectAttempts = 0
+    this._reconnectTimer = null
+    this._pingInterval = null
+
+    // Track the "Connection lost" system block for in-place update (N34 dedup)
+    this._connLostEl = null
+
+    // Track the in-progress compact block for in-place update
+    this._compactProgressEl = null
+
+    // Track the in-progress assistant message block (partial_message updates)
+    this._liveAssistantBlock = null
+    this._liveAssistantId = null  // message id if available
+
+    // Track the in-progress subagent streaming activity block (separate from main live block)
+    this._liveSubagentBlock = null
+
+    this._replayCache = new ReplayCache()
+
+    // Thinking state: true when claude is processing a turn
+    this._thinking = false
+
+    // Subagent phase: true when the main turn is waiting for a subagent (Task tool).
+    // In this phase thinking=true (outer turn still running) but the main Claude model
+    // is idle — the UI should show Send so the user can chat/queue messages.
+    this._inSubagentPhase = false
+
+    // Turn timing: timestamp (Date.now()) when the current turn started.
+    // Reset to null when turn ends. Used for turn-complete notification threshold.
+    this._turnStartTime = null
+
+    // Replay mode flag: true while _fetchAndReplayHistory is running.
+    // Used to suppress per-block rAF scrolls and TTS dispatches during bulk replay.
+    this._replayMode = false
+
+    // Streaming render throttle: rAF handle for pending live-block markdown update.
+    // Prevents running marked.parse() on every WS chunk (can be 10s/sec).
+    this._streamRafPending = false
+
+    this._connect()
+  }
+
+  _updateScrollBtn() {
+    const s = this._scroll
+    // Consider "at bottom" if within 60px of the bottom (handles rounding/sub-px)
+    const atBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 60
+    this._scrollBtn.classList.toggle('cbr-scroll-btn-visible', !atBottom)
+  }
+
+  // ── Thinking state (for external UI) ────────────────────────────────────────
+
+  isThinking() {
+    return this._thinking
+  }
+
+  // Returns true if a live (non-replay) event signals that a turn is actively
+  // running on the backend. Used to derive busy state from the server stream so
+  // the composer queues follow-up messages even when this client did not locally
+  // start the turn (reload/reconnect mid-turn, fast turns, multi-client).
+  //
+  // Turn-progress signals (SDK & CLI):
+  //   - system/init, system/status : SDK emits these at turn start
+  //   - assistant                  : streamed assistant message
+  //   - partial_message            : CLI streaming partials
+  //   - stream_event               : SDK streaming partials (includePartialMessages)
+  //   - rate_limit_event           : arrives mid-turn while the model is working
+  // Explicitly NOT turn-progress: 'result' (ends turn), 'user' (echo), and other
+  // 'system' subtypes (queued/info/resume-trigger/error/hook/stderr/fallback).
+  _isLiveTurnEvent(event) {
+    if (!event || !event.type) return false
+    // Subagent events carry parent_tool_use_id. They are NOT main-turn progress —
+    // the main turn is waiting, not actively generating. Returning false here keeps
+    // the main turn's thinking state stable (no flicker) while subagents run.
+    if (event.parent_tool_use_id) return false
+    switch (event.type) {
+      case 'assistant':
+      case 'partial_message':
+      case 'stream_event':
+      case 'rate_limit_event':
+        return true
+      case 'system':
+        return event.subtype === 'init' || event.subtype === 'status'
+      default:
+        return false
+    }
+  }
+
+  _setThinking(val) {
+    if (this._thinking === val) return
+    this._thinking = val
+    if (val) {
+      // Record when this turn started for elapsed-time notification
+      this._turnStartTime = Date.now()
+    }
+    // Broadcast to terminal-view.js so input bar can react
+    document.dispatchEvent(new CustomEvent('nanocode:claude-thinking', {
+      detail: { tabId: this.tabId, thinking: val },
+    }))
+    // When turn ends, also clear subagent phase so UI resets cleanly
+    if (!val && this._inSubagentPhase) {
+      this._inSubagentPhase = false
+    }
+  }
+
+  // Broadcast subagent-phase transitions so the input bar can show Send (not Stop)
+  // while the main agent is idle and waiting for a subagent to finish.
+  _setSubagentPhase(active) {
+    if (this._inSubagentPhase === active) return
+    this._inSubagentPhase = active
+    document.dispatchEvent(new CustomEvent('nanocode:claude-subagent-phase', {
+      detail: { tabId: this.tabId, active },
+    }))
+  }
+
+  // ── Public API ───────────────────────────────────────────────────────────────
+
+  sendInputWithEcho(text) {
+    // Generate a nonce so the server echoes back a 'user' event with this same
+    // nonce. When our WS receives that broadcast we can recognise it as our own
+    // locally-echoed turn and skip rendering it again (dedup). On reconnect the
+    // 'user' event is replayed from server history without the nonce matching any
+    // pending-set entry, so it *will* be rendered — fixing the reconnect bug.
+    const nonce = (Math.random() * 0xFFFFFFFF | 0).toString(36) + Date.now().toString(36)
+    if (!this._pendingNonces) this._pendingNonces = new Set()
+    this._pendingNonces.add(nonce)
+    // User is actively sending — always scroll to bottom regardless of scroll position
+    this._userScrolledUp = false
+    this._appendUserBlock(text)
+    this._send({ type: 'claude-input', text, _nonce: nonce })
+    // Clear any live assistant block so next response starts fresh
+    this._liveAssistantBlock = null
+    this._liveAssistantId = null
+    // Enter thinking state
+    this._setThinking(true)
+  }
+
+  sendRaw(data) {
+    // Ctrl+C: POST interrupt API (real interrupt, not a no-op).
+    // This is called by the touch toolbar ctrl-c button and legacy callers.
+    // Do NOT call showInterruptBlock() — CLI emits result/error_during_execution via stdout.
+    if (data === '\x03') {
+      if (this.projectId && this.tabId) {
+        fetch(`/api/projects/${this.projectId}/tabs/${this.tabId}/interrupt`, { method: 'POST' })
+          .catch(() => {})
+      }
+    }
+    // Ctrl+L: visually clear the scroll area
+    if (data === '\x0c') {
+      this._scroll.innerHTML = ''
+    }
+  }
+
+  /**
+   * N19 fix: Clear DOM + history state after a session reset so old queued
+   * events cannot replay into the new session's view. Called by the reset
+   * button handler in terminal-view.js after the POST /reset succeeds.
+   */
+  clearAfterReset() {
+    // Stop lazy-history observer
+    this._removeHistorySentinel()
+    this._replayCache.resetAll()
+
+    // Clear visible DOM
+    this._scroll.innerHTML = ''
+    this._liveAssistantBlock = null
+    this._liveAssistantId = null
+    this._liveSubagentBlock = null
+    if (this._liveToolBlocks) this._liveToolBlocks.clear()
+
+    // Reset dedup sets so new session events are not silently skipped
+    this._pendingNonces = new Set()
+
+    // Exit thinking state
+    this._thinking = false
+    document.dispatchEvent(new CustomEvent('nanocode:claude-thinking', {
+      detail: { tabId: this.tabId, thinking: false },
+    }))
+
+    this._addSystemBlock('[Session reset. Starting fresh.]')
+  }
+
+  /**
+   * Insert a CLI-style interrupted block into the conversation flow.
+   * Called by doInterrupt() (Esc / Stop btn) and sendRaw('\x03') (Ctrl+C / touch toolbar).
+   * Text matches the Claude CLI: "[Request interrupted by user]".
+   */
+  showInterruptBlock() {
+    const article = createSystemBlock('[Request interrupted by user]', { escHtml })
+    article.className += ' cbr-block-interrupted'
+    article.querySelector('.cbr-system')?.classList?.add('cbr-interrupted')
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  dispose() {
+    clearTimeout(this._reconnectTimer)
+    this._stopPing()
+    this._removeHistorySentinel()
+    if (this._ws) {
+      this._ws.onclose = null
+      this._ws.close()
+      this._ws = null
+    }
+  }
+
+  // ── jsonl history replay ─────────────────────────────────────────────────────
+
+  /**
+   * Fetch the persisted claude session history from the server and replay it
+   * into the renderer. Called once on first WS open (not reconnects — those
+   * replay from in-memory cs.history via the WS broadcast).
+   *
+   * Lazy loading strategy (front-end batching):
+   *   - All events are fetched from the server at once (no backend pagination).
+   *   - Only the last INITIAL_HISTORY_BLOCKS events are rendered into the DOM.
+   *   - A sentinel <div> is inserted at the top; an IntersectionObserver watches
+   *     it and prepends another HISTORY_PAGE_SIZE batch when the user scrolls up.
+   *   - Scroll position is preserved via scrollHeight-delta compensation so the
+   *     view doesn't jump when older content is prepended.
+   *
+   * De-dup strategy: ALL fetched events' transport replay keys are recorded in
+   * ReplayCache.transportKeys (even those not yet rendered). When the WS subsequently
+   * replays cs.history the dedup guard will skip already-seen events regardless
+   * of render status. When "load more" renders older events they are NOT re-added
+   * to ReplayCache.transportKeys
+   * (they're already there), so no issues arise.
+   */
+  async _fetchAndReplayHistory() {
+    const url = `/api/projects/${this.projectId}/tabs/${this.tabId}/history`
+    let data
+    try {
+      const resp = await fetch(url)
+      if (!resp.ok) return  // 404 for non-claude tab or missing project — silent
+      data = await resp.json()
+    } catch {
+      return  // network error — degrade gracefully
+    }
+
+    const events = data?.events
+    if (!Array.isArray(events) || events.length === 0) return
+
+    // Register ALL transport replay keys for dedup (even those we won't render immediately).
+    // This is important: WS cs.history replay must skip ALL of these events,
+    // not just the ones we rendered. Otherwise older-but-not-yet-rendered events
+    // would be rendered again when a WS reconnect replays cs.history.
+    this._replayCache.rememberFetchedEvents(events)
+
+    // Capture server pagination state
+    this._replayCache.historyHasServerMore = !!data?.hasMore
+    this._replayCache.historyFirstUuid = data?.firstUuid || (events.length > 0 ? (events[0].uuid || null) : null)
+
+    // ── Determine which slice to render initially ────────────────────────────
+    // We render the last INITIAL_HISTORY_BLOCKS events (most recent), so the
+    // user lands at the bottom seeing the newest messages. Everything before
+    // that index is available for "load more" when scrolling up.
+    const totalEvents = events.length
+    const initialStart = Math.max(0, totalEvents - INITIAL_HISTORY_BLOCKS)
+    this._replayCache.historyRenderedStart = initialStart
+
+    const hasOlderHistory = initialStart > 0 || this._replayCache.historyHasServerMore
+
+    // Show a subtle separator. If we truncated, note how many older events exist.
+    if (hasOlderHistory) {
+      this._addSystemBlock(
+        `[Showing last ${totalEvents - initialStart} of ${totalEvents} event(s). Scroll up to load more.]`
+      )
+    } else {
+      this._addSystemBlock(`[Restored ${totalEvents} event(s) from session history]`)
+    }
+
+    // Insert the top-sentinel BEFORE rendering initial blocks (so it sits at top).
+    if (hasOlderHistory) {
+      this._insertHistorySentinel()
+    }
+
+    // ── Render the initial slice in batch replay mode ────────────────────────
+    // Suppress per-block _scrollBottom() rAF callbacks and TTS dispatches;
+    // do a single scroll-to-bottom at the end.
+    this._replayMode = true
+    try {
+      for (let i = initialStart; i < totalEvents; i++) {
+        this._handleEvent(events[i], { fromReplay: true })
+      }
+    } finally {
+      this._replayMode = false
+    }
+
+    // Single scroll-to-bottom after all initial blocks are in DOM.
+    // Reset _userScrolledUp so auto-scroll resumes from a clean state after history load.
+    this._userScrolledUp = false
+    requestAnimationFrame(() => {
+      this._scroll.scrollTop = this._scroll.scrollHeight
+      this._updateScrollBtn()
+    })
+  }
+
+  /**
+   * Insert a sentinel element at the very top of the scroll area and wire up
+   * an IntersectionObserver to trigger loading more history when the sentinel
+   * becomes visible (i.e. the user scrolled up to the top).
+   */
+  _insertHistorySentinel() {
+    if (this._replayCache.historyLoadingSentinel) return
+
+    const sentinel = document.createElement('div')
+    sentinel.className = 'cbr-history-sentinel'
+    sentinel.setAttribute('aria-hidden', 'true')
+    // Minimal visual indicator: a thin loading stripe that disappears once all
+    // history is loaded. Height=32px ensures IntersectionObserver fires reliably.
+    sentinel.style.cssText = 'height:32px;display:flex;align-items:center;justify-content:center;gap:8px;color:var(--text-muted,#888);font-size:12px;opacity:0.7;'
+
+    // Add a clickable "Load earlier" button for server-side pagination
+    const loadBtn = document.createElement('button')
+    loadBtn.className = 'cbr-history-load-btn'
+    loadBtn.style.cssText = 'background:none;border:1px solid var(--border,#444);border-radius:4px;color:inherit;cursor:pointer;font-size:11px;padding:2px 8px;opacity:0.8;'
+    loadBtn.textContent = '↑ Load earlier'
+    loadBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this._loadEarlierFromServer()
+    })
+    sentinel.appendChild(loadBtn)
+
+    const hint = document.createElement('span')
+    hint.textContent = 'scroll up to auto-load'
+    sentinel.appendChild(hint)
+
+    this._replayCache.historyLoadingSentinel = sentinel
+
+    // Prepend: must be the very first child so it's at the top visually
+    if (this._scroll.firstChild) {
+      this._scroll.insertBefore(sentinel, this._scroll.firstChild)
+    } else {
+      this._scroll.appendChild(sentinel)
+    }
+
+    // IntersectionObserver: fires when sentinel enters the viewport.
+    // threshold:0 = fires as soon as even 1px is visible.
+    // We use rootMargin:0px so it only fires when truly in view.
+    this._replayCache.historyObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            this._loadMoreHistory()
+          }
+        }
+      },
+      { root: this._scroll, threshold: 0, rootMargin: '0px' }
+    )
+    this._replayCache.historyObserver.observe(sentinel)
+  }
+
+  /**
+   * Prepend the next batch of older history events into the DOM.
+   * Preserves scroll position by compensating for the added scrollHeight.
+   * Called by the IntersectionObserver when the sentinel scrolls into view.
+   */
+  _loadMoreHistory() {
+    if (this._replayCache.historyLoading) return
+    if (this._replayCache.historyRenderedStart <= 0) {
+      // Local events exhausted — try server-side pagination if available
+      if (this._replayCache.historyHasServerMore && !this._replayCache.historyServerLoading) {
+        this._loadEarlierFromServer()
+      } else if (!this._replayCache.historyHasServerMore) {
+        // Nothing more to load — remove sentinel
+        this._removeHistorySentinel()
+      }
+      return
+    }
+
+    this._replayCache.historyLoading = true
+
+    // Determine the slice to prepend
+    const endIdx = this._replayCache.historyRenderedStart
+    const startIdx = Math.max(0, endIdx - HISTORY_PAGE_SIZE)
+    this._replayCache.historyRenderedStart = startIdx
+
+    // Capture current scroll offset for position compensation
+    const scrollEl = this._scroll
+    const scrollHeightBefore = scrollEl.scrollHeight
+    const scrollTopBefore = scrollEl.scrollTop
+
+    // Render older events into a DocumentFragment (off-DOM for perf)
+    const frag = document.createDocumentFragment()
+
+    // We need to insert a temporary container to collect new articles,
+    // then prepend them all at once. We render into a detached container.
+    const tempContainer = document.createElement('div')
+
+    // Temporarily redirect this._scroll to the temp container so all
+    // _render* and _add* methods append there. Restore afterward.
+    const realScroll = this._scroll
+    this._scroll = tempContainer
+
+    this._replayMode = true
+    try {
+      for (let i = startIdx; i < endIdx; i++) {
+        this._handleEvent(this._replayCache.historyEvents[i], { fromReplay: true })
+      }
+    } finally {
+      this._replayMode = false
+      this._scroll = realScroll
+    }
+
+    // Move all newly-rendered children from tempContainer into a fragment
+    while (tempContainer.firstChild) {
+      frag.appendChild(tempContainer.firstChild)
+    }
+
+    // Find insertion point: just after the sentinel (index 1 if sentinel is [0])
+    const sentinel = this._replayCache.historyLoadingSentinel
+    const insertAfter = sentinel || null
+
+    if (insertAfter && insertAfter.parentNode === scrollEl) {
+      // Insert the batch right after the sentinel
+      insertAfter.insertAdjacentElement ? null : null  // (not used; manual DOM splice)
+      const nextSibling = insertAfter.nextSibling
+      if (nextSibling) {
+        scrollEl.insertBefore(frag, nextSibling)
+      } else {
+        scrollEl.appendChild(frag)
+      }
+    } else {
+      // Fallback: prepend to the very top
+      if (scrollEl.firstChild) {
+        scrollEl.insertBefore(frag, scrollEl.firstChild)
+      } else {
+        scrollEl.appendChild(frag)
+      }
+    }
+
+    // ── Scroll position compensation ─────────────────────────────────────────
+    // Adding content at the top shifts all existing content down by the newly
+    // added height. Compensate by adding the same delta to scrollTop so the
+    // viewport appears unchanged (the user's current view stays in place).
+    const scrollHeightAfter = scrollEl.scrollHeight
+    const addedHeight = scrollHeightAfter - scrollHeightBefore
+    scrollEl.scrollTop = scrollTopBefore + addedHeight
+
+    this._replayCache.historyLoading = false
+
+    // If we just rendered all remaining in-memory history, check server
+    if (startIdx <= 0) {
+      if (!this._replayCache.historyHasServerMore) {
+        this._removeHistorySentinel()
+      }
+      // else: sentinel stays — user can click "Load earlier" or scroll triggers _loadEarlierFromServer
+    }
+  }
+
+  /**
+   * Remove the top sentinel and disconnect the IntersectionObserver.
+   * Called when all history has been loaded.
+   */
+  _removeHistorySentinel() {
+    if (this._replayCache.historyObserver) {
+      this._replayCache.historyObserver.disconnect()
+      this._replayCache.historyObserver = null
+    }
+    if (this._replayCache.historyLoadingSentinel) {
+      if (this._replayCache.historyLoadingSentinel.parentNode) {
+        this._replayCache.historyLoadingSentinel.parentNode.removeChild(this._replayCache.historyLoadingSentinel)
+      }
+      this._replayCache.historyLoadingSentinel = null
+    }
+  }
+
+  /**
+   * Fetch an older page of history from the server using ?before=<uuid> pagination.
+   * Called when local in-memory events are exhausted but server indicated hasMore=true.
+   * Prepends the fetched events to the DOM and updates pagination state.
+   */
+  async _loadEarlierFromServer() {
+    if (this._replayCache.historyServerLoading) return
+    if (!this._replayCache.historyHasServerMore) return
+
+    const beforeUuid = this._replayCache.historyFirstUuid
+    if (!beforeUuid) {
+      // No anchor UUID — can't paginate; hide button
+      this._replayCache.historyHasServerMore = false
+      this._updateSentinelBtn()
+      return
+    }
+
+    this._replayCache.historyServerLoading = true
+    this._updateSentinelBtn(true)
+
+    const url = `/api/projects/${this.projectId}/tabs/${this.tabId}/history?before=${encodeURIComponent(beforeUuid)}`
+    let data
+    try {
+      const resp = await fetch(url)
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      data = await resp.json()
+    } catch (err) {
+      console.warn('[cbr] _loadEarlierFromServer failed:', err)
+      this._replayCache.historyServerLoading = false
+      this._updateSentinelBtn(false)
+      return
+    }
+
+    const events = data?.events
+    if (!Array.isArray(events) || events.length === 0) {
+      // Server returned nothing — no more history
+      this._replayCache.historyHasServerMore = false
+      this._replayCache.historyServerLoading = false
+      this._removeHistorySentinel()
+      return
+    }
+
+    // Register new events for dedup
+    for (const event of events) {
+      const key = this._replayCache.getEventReplayKey(event)
+      if (key) this._replayCache.transportKeys.add(key)
+    }
+
+    // Update pagination cursors
+    this._replayCache.historyHasServerMore = !!data?.hasMore
+    this._replayCache.historyFirstUuid = data?.firstUuid || (events[0].uuid || null)
+
+    // Prepend events to DOM with scroll compensation
+    const scrollEl = this._scroll
+    const scrollHeightBefore = scrollEl.scrollHeight
+    const scrollTopBefore = scrollEl.scrollTop
+
+    const tempContainer = document.createElement('div')
+    const realScroll = this._scroll
+    this._scroll = tempContainer
+    this._replayMode = true
+    try {
+      for (const event of events) {
+        this._handleEvent(event, { fromReplay: true })
+      }
+    } finally {
+      this._replayMode = false
+      this._scroll = realScroll
+    }
+
+    const frag = document.createDocumentFragment()
+    while (tempContainer.firstChild) frag.appendChild(tempContainer.firstChild)
+
+    const sentinel = this._replayCache.historyLoadingSentinel
+    if (sentinel && sentinel.parentNode === scrollEl) {
+      const nextSibling = sentinel.nextSibling
+      if (nextSibling) {
+        scrollEl.insertBefore(frag, nextSibling)
+      } else {
+        scrollEl.appendChild(frag)
+      }
+    } else {
+      if (scrollEl.firstChild) {
+        scrollEl.insertBefore(frag, scrollEl.firstChild)
+      } else {
+        scrollEl.appendChild(frag)
+      }
+    }
+
+    // Compensate scroll position
+    const scrollHeightAfter = scrollEl.scrollHeight
+    scrollEl.scrollTop = scrollTopBefore + (scrollHeightAfter - scrollHeightBefore)
+
+    this._replayCache.historyServerLoading = false
+
+    if (!this._replayCache.historyHasServerMore) {
+      this._removeHistorySentinel()
+    } else {
+      this._updateSentinelBtn(false)
+    }
+  }
+
+  /**
+   * Update the sentinel button text/state based on loading status.
+   */
+  _updateSentinelBtn(loading) {
+    const sentinel = this._replayCache.historyLoadingSentinel
+    if (!sentinel) return
+    const btn = sentinel.querySelector('.cbr-history-load-btn')
+    if (!btn) return
+    if (loading) {
+      btn.textContent = '↑ Loading…'
+      btn.disabled = true
+    } else {
+      btn.textContent = this._replayCache.historyHasServerMore ? '↑ Load earlier' : '↑ No more history'
+      btn.disabled = !this._replayCache.historyHasServerMore
+    }
+  }
+
+  // ── WS connection ────────────────────────────────────────────────────────────
+
+  _connect() {
+    this._exited = false
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    this._ws = new WebSocket(`${proto}//${location.host}${WS_PATH}`)
+
+    this._ws.onopen = () => {
+      const isReconnect = this._reconnectAttempts > 0
+      this._reconnectAttempts = 0
+      this.onStatusChange(true)
+
+      // On both first connect and reconnect: reset render state and fetch
+      // history from disk (jsonl). This ensures:
+      //   - Page reloads / bfcache misses restore FULL history from disk, not
+      //     just the in-memory ring buffer (≤500 events). Root cause of
+      //     "records disappeared after switching tabs to view GLB".
+      //   - WS reconnects also get a fresh jsonl replay so long sessions whose
+      //     cs.history ring buffer rolled over don't lose older messages.
+      //
+      // De-dup: ReplayCache.transportKeys is reset below so the fresh jsonl replay is not
+      // blocked by the previous session's dedup set. WS cs.history events that
+      // arrive AFTER the attach are deduplicated against the new set.
+      if (isReconnect) {
+        // Clean up lazy loading state before clearing the DOM
+        this._removeHistorySentinel()
+        this._replayCache.resetAll()
+
+        this._scroll.innerHTML = ''
+        this._liveAssistantBlock = null
+        this._liveAssistantId = null
+        this._liveSubagentBlock = null
+        this._pendingNonces = new Set()
+        this._thinking = false
+        // Clear the "Connection lost" dedup block on successful reconnect (N34)
+        this._connLostEl = null
+        this._addSystemBlock('[Reconnected. Restoring session history…]')
+      }
+      // Both first-connect and reconnect: fetch full jsonl history from disk.
+      // On reconnect this supersedes the old cs.history-only path, giving
+      // complete history regardless of how long the session has been running.
+      //
+      // IMPORTANT: send the attach message AFTER _fetchAndReplayHistory resolves.
+      // The server replays cs.history immediately upon attach; if we sent attach
+      // first, those WS events would race with the jsonl fetch and arrive before
+      // ReplayCache.transportKeys is populated — causing double-render of all events that
+      // exist in both cs.history and the jsonl. Awaiting the fetch first ensures
+      // ReplayCache.transportKeys is already filled so WS duplicates are deduped correctly.
+      this._fetchAndReplayHistory().finally(() => {
+        // Always send attach — even if jsonl fetch failed (404, network error).
+        // Without attach the session never starts and the tab hangs blank.
+        this._send({
+          type: 'attach',
+          projectId: this.projectId,
+          sessionType: 'bash',
+          tabId: this.tabId,
+          cols: 200,
+          rows: 50,
+        })
+      })
+      this._startPing()
+    }
+
+    this._ws.onmessage = (e) => {
+      let msg
+      try { msg = JSON.parse(e.data) } catch { return }
+
+      if (msg.type === 'claude-event') {
+        this._handleEvent(msg.event)
+      } else if (msg.type === 'pong') {
+        // ignore
+      } else if (msg.type === 'exit') {
+        this._exited = true
+        // N13 fix: clear thinking state on session exit so the client input bar
+        // unlocks and any client-side _pendingQueue can flush to the new session.
+        this._setThinking(false)
+        this._addSystemBlock(`[Session ended (exit ${msg.exitCode ?? '?'}). Send a message to start a new session.]`)
+      } else if (msg.type === 'error') {
+        this._addSystemBlock('[Error: ' + (msg.error || 'unknown') + ']')
+      }
+    }
+
+    this._ws.onclose = () => {
+      this._stopPing()
+      this.onStatusChange(false)
+      if (!this._exited) {
+        const delay = Math.min(BACKOFF_BASE * 2 ** this._reconnectAttempts, BACKOFF_MAX)
+        this._reconnectAttempts++
+        // N34: update the same "Connection lost" block in-place instead of appending new ones
+        const msg = `[Connection lost. Reconnecting in ${(delay / 1000).toFixed(1)}s…]`
+        if (this._connLostEl) {
+          // Update existing block in-place
+          const p = this._connLostEl.querySelector('p.cbr-system')
+          if (p) p.textContent = msg
+        } else {
+          this._connLostEl = this._addSystemBlock(msg)
+        }
+        clearTimeout(this._reconnectTimer)
+        this._reconnectTimer = setTimeout(() => this._connect(), delay)
+      }
+    }
+
+    this._ws.onerror = () => {}
+  }
+
+  _send(msg) {
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+      this._ws.send(JSON.stringify(msg))
+      return true
+    }
+    // N1 fix: warn when a user message is dropped due to disconnected WS
+    if (msg.type === 'claude-input') {
+      this._addSystemBlock('[Connection not ready — message may not have been sent. Please wait for reconnection.]')
+    }
+    return false
+  }
+
+  _startPing() {
+    this._stopPing()
+    this._pingInterval = setInterval(() => {
+      this._send({ type: 'ping', id: Date.now() })
+    }, PING_INTERVAL_MS)
+  }
+
+  _stopPing() {
+    if (this._pingInterval) {
+      clearInterval(this._pingInterval)
+      this._pingInterval = null
+    }
+  }
+
+  // ── Event dispatch ────────────────────────────────────────────────────────────
+
+  _handleEvent(event, opts = {}) {
+    if (!event || !event.type) return
+
+    // Dedup: if this event was already rendered via _fetchAndReplayHistory (jsonl replay),
+    // skip it to avoid double-rendering when cs.history replays the same events.
+    // opts.fromReplay=true means the call IS the initial jsonl replay -> skip the dedup check.
+    if (!opts.fromReplay && this._replayCache.hasTransportReplay(event)) {
+      return
+    }
+
+    // ── Server-driven thinking state (busy detection) ────────────────────────
+    // Previously thinking=true was set ONLY by sendInputWithEcho() (local echo).
+    // That left isClaudeThinking=false whenever a turn was in progress but THIS
+    // client didn't locally start it — page reload/reconnect mid-turn, a fast
+    // turn whose result raced ahead, or a turn started from another client. In
+    // those cases the desktop composer believed Claude was idle, so a follow-up
+    // message took the "send immediately" branch and scrolled away instead of
+    // entering the pending queue / queue tray (mobile + CLI queue correctly).
+    //
+    // Fix: any LIVE (non-replay) turn-progress event means the SDK/CLI turn is
+    // actively running -> mark thinking=true so the composer queues follow-ups.
+    // 'result' is excluded (it ends the turn -> _handleResult sets false). We
+    // skip during jsonl replay (opts.fromReplay) so restoring a COMPLETED
+    // session does not falsely show busy. _setThinking() no-ops when unchanged,
+    // so this is idempotent and never re-fires the event spuriously.
+    if (!opts.fromReplay && !this._exited && this._isLiveTurnEvent(event)) {
+      this._setThinking(true)
+      // Main-turn event → exit subagent phase (main agent is actively generating again)
+      this._setSubagentPhase(false)
+    } else if (!opts.fromReplay && !this._exited && this._thinking && event.parent_tool_use_id) {
+      // Subagent event while main turn is running → enter subagent phase so the UI
+      // shows Send (not Stop), allowing the user to chat/queue messages while waiting.
+      this._setSubagentPhase(true)
+    }
+
+    switch (event.type) {
+      case 'system':
+        this._handleSystem(event)
+        break
+      case 'assistant':
+        this._handleAssistant(event)
+        break
+      case 'partial_message':
+        this._handlePartialMessage(event)
+        break
+      case 'result':
+        this._handleResult(event)
+        break
+      case 'rate_limit_event':
+        this._handleRateLimit(event)
+        break
+      // 'user' events come from two sources:
+      //   1. Real-time broadcast: the server echoes back our own turn right after
+      //      we sent it. We can skip rendering because _appendUserBlock() already
+      //      showed it (dedup via nonce).
+      //   2. History replay on reconnect: the server stored the event in cs.history
+      //      and replays it when we reconnect. In this case no matching nonce is
+      //      pending, so we *must* render it so the user can see their past turns.
+      case 'user':
+        this._handleUserEvent(event, opts)
+        break
+      default:
+        // Unknown event: ignore silently
+        break
+    }
+
+    // Dispatch for TTS and other listeners (skip during replay — history events
+    // should not trigger TTS playback or other real-time side-effects)
+    if (!this._replayMode) {
+      document.dispatchEvent(new CustomEvent('nanocode:terminal-output', {
+        detail: JSON.stringify(event),
+      }))
+    }
+  }
+
+  _handleUserEvent(event, opts = {}) {
+    // Dedup: if we sent this turn ourselves, a nonce will be in _pendingNonces.
+    // Consume and skip so we don't double-render the locally echoed block.
+    const nonce = event._nonce
+    if (nonce && this._pendingNonces && this._pendingNonces.has(nonce)) {
+      this._pendingNonces.delete(nonce)
+      return
+    }
+
+    let content = event.message?.content
+    // Normalize: jsonl user messages may have content as a plain string (the user's text).
+    // Wrap it in the array form the renderer expects so all code paths work uniformly.
+    if (typeof content === 'string') {
+      content = [{ type: 'text', text: content }]
+    }
+    if (!Array.isArray(content)) return
+
+    // Filter CLI internal interrupt marker — CLI emits this to record context in the
+    // conversation log, but it should NOT be rendered as a user message bubble.
+    // The interrupt outcome is surfaced via result/error_during_execution instead.
+    if (content.length === 1 && content[0]?.type === 'text' &&
+        content[0]?.text === '[Request interrupted by user]') {
+      return
+    }
+
+    // Filter system-injected protocol tags that pollute the history replay.
+    // These are injected by the Claude SDK/harness into the conversation context
+    // and should never be shown as visible user messages. We drop any user turn
+    // whose text content, after stripping all recognised protocol tags, is empty.
+    //
+    // Recognised tags: <task-notification>…</task-notification>
+    //                  <system-reminder>…</system-reminder>
+    //
+    // Strategy: strip tag content, trim whitespace — if nothing remains, skip render.
+    // This works for both replay (history) and real-time events (unlikely but possible).
+    if (content.length === 1 && content[0]?.type === 'text') {
+      const rawText = content[0].text || ''
+      const stripped = rawText
+        .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, '')
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+        .trim()
+      if (!stripped) {
+        // Entire message was protocol noise — do not render
+        return
+      }
+    }
+
+    // Subagent activity: events with parent_tool_use_id are messages TO a subagent
+    // or results FROM a subagent. Visibility controlled by the subagent-activity toggle.
+    // Root F fix: NEVER return early — always build DOM, set display:none if toggle off.
+    // This makes the toggle reversible for events that already streamed through.
+    const parentToolUseId = event.parent_tool_use_id
+    if (parentToolUseId) {
+      // UUID dedup: on history replay the same subagent events come again; skip if seen
+      const uuid = event.uuid
+      if (uuid && this._replayCache.markSubagentSeen(uuid)) return
+      const isVisible = getSubagentActivityVisible()
+      // Render subagent prompt (text) or tool_result inside the subagent context
+      for (const c of content) {
+        if (c.type === 'text' && c.text?.trim()) {
+          const article = this._makeBlock('cbr-block-subagent-activity')
+          if (!isVisible) article.style.display = 'none'
+          article.innerHTML =
+            `<div class="cbr-subagent-activity-label">subagent input</div>` +
+            `<pre class="cbr-pre cbr-tool-result-pre">${escHtml(c.text.slice(0, 2000))}${c.text.length > 2000 ? '\n…' : ''}</pre>`
+          this._scroll.appendChild(article)
+          this._scrollBottom()
+        } else if (c.type === 'tool_result') {
+          this._renderToolResultPart(c, { subagentActivity: true, visible: isVisible })
+        }
+      }
+      return
+    }
+
+    // Normal user event (no parent): render text turns and tool results.
+    for (const c of content) {
+      if (c.type === 'text' && c.text?.trim()) {
+        // Skill load injection: user turns whose content begins with the canonical
+        // "Base directory for this skill:" prefix are skill SKILL.md content dumps
+        // injected by the Claude SDK. Fold them to a single collapsible line so
+        // they don't flood the conversation on every reload.
+        if (c.text.startsWith('Base directory for this skill:')) {
+          this._appendSkillLoadBlock(c.text)
+        } else {
+          // History-replayed user turn (no nonce match above) — show user prompt
+          this._appendUserBlock(c.text)
+        }
+      } else if (c.type === 'tool_result') {
+        // Tool output arrives as tool_result in the user turn following each tool_use.
+        // This is the content that was previously invisible ("全是一条线" bug).
+        this._renderToolResultPart(c)
+      }
+    }
+  }
+
+  _handleSystem(event) {
+    // ── Compact progress feedback ────────────────────────────────────────────
+    // SDK emits: status{status:'compacting'} → compact_boundary → status{status:null, compact_result}
+    if (event.subtype === 'status') {
+      if (event.status === 'compacting') {
+        // Show an in-progress "Compacting context…" block
+        const article = document.createElement('article')
+        article.className = 'cbr-block cbr-block-system cbr-compact-progress'
+        article.innerHTML = `<p class="cbr-system cbr-compact-label"><span class="cbr-compact-spinner"></span>Compacting context…</p>`
+        this._scroll.appendChild(article)
+        this._compactProgressEl = article
+        this._scrollBottom()
+        return
+      }
+      if (event.status === null && event.compact_result != null) {
+        // Compact finished: update the progress block to show result
+        if (this._compactProgressEl) {
+          const success = event.compact_result === 'success'
+          const label = success ? 'Context compacted' : `Compact failed: ${event.compact_error || 'unknown error'}`
+          const p = this._compactProgressEl.querySelector('p')
+          if (p) {
+            p.innerHTML = `<span class="cbr-compact-done">${success ? '✓' : '✗'}</span>${escHtml(label)}`
+            p.classList.toggle('cbr-compact-failed', !success)
+          }
+          this._compactProgressEl.classList.remove('cbr-compact-progress')
+          this._compactProgressEl = null
+        }
+        return
+      }
+      // Other status values (e.g. 'requesting') — ignore silently
+      return
+    }
+    if (event.subtype === 'compact_boundary') {
+      // compact_boundary arrives after the summary is written but before status{null}.
+      // Update progress block text to "Context compacted" eagerly.
+      if (this._compactProgressEl) {
+        const meta = event.compact_metadata || {}
+        const postTok = meta.post_tokens ? ` (${meta.post_tokens.toLocaleString()} tokens)` : ''
+        const p = this._compactProgressEl.querySelector('p')
+        if (p) {
+          p.innerHTML = `<span class="cbr-compact-done">✓</span>${escHtml('Context compacted' + postTok)}`
+        }
+        this._compactProgressEl.classList.remove('cbr-compact-progress')
+        this._compactProgressEl = null
+      }
+      return
+    }
+    if (event.subtype === 'init') {
+      const toolCount = Array.isArray(event.tools) ? event.tools.length : '?'
+      const sessionId = event.session_id ? event.session_id.slice(0, 8) + '…' : '—'
+      // P1-2: show model, plugin count, fast_mode_state in addition to basic session info
+      const model = event.model ? ` · ${escHtml(event.model)}` : ''
+      const pluginCount = Array.isArray(event.plugins) && event.plugins.length > 0
+        ? ` · ${event.plugins.length} plugin${event.plugins.length !== 1 ? 's' : ''}`
+        : ''
+      const fastMode = event.fast_mode_state != null ? ` · fast:${escHtml(String(event.fast_mode_state))}` : ''
+      this._addSystemBlock(`[Session ${sessionId} · ${toolCount} tools available${model}${pluginCount}${fastMode}]`)
+    } else if (event.subtype === 'hook_started' || event.subtype === 'hook_response') {
+      // Default: suppress hook noise. Debug mode could show them.
+      // No-op intentionally.
+    } else if (event.subtype === 'stderr') {
+      this._addSystemBlock(`[stderr: ${event.text}]`)
+    } else if (event.subtype === 'spawn_error') {
+      this._addSystemBlock(`[Failed to start claude: ${event.text}]`)
+    } else if (event.subtype === 'sdk_error_fallback') {
+      this._addSdkFallbackBanner(event.text)
+    } else if (event.subtype === 'queued') {
+      // Message was queued while server was busy — show feedback inline
+      this._addSystemBlock(`[queued: ${event.text}]`)
+    } else if (event.subtype === 'info') {
+      this._addSystemBlock(`[${event.text}]`)
+    } else if (event.subtype === 'resume-trigger') {
+      // Server intercepted /resume and resolved the target session.
+      // Show feedback then dispatch the same event that Recent Agents uses.
+      const label = event.projectName
+        ? `Resuming session in ${event.projectName}…`
+        : 'Resuming previous session…'
+      this._addSystemBlock(`[${label}]`)
+      document.dispatchEvent(new CustomEvent('nanocode:resume-session', {
+        detail: { projectId: event.projectId, sessionId: event.sessionId, cwd: event.cwd },
+      }))
+    }
+  }
+
+  _handleAssistant(event) {
+    // Root F fix: do NOT return early for subagent events even when activity toggle is off.
+    // Instead, build DOM with display:none so toggle can reveal it later.
+    const isSubagentAssistant = !!event.parent_tool_use_id
+
+    if (isSubagentAssistant) {
+      // UUID dedup: history replay may resend subagent events; skip if already seen
+      const uuid = event.uuid || (event.message && event.message.id)
+      if (uuid && this._replayCache.markSubagentSeen(uuid)) return
+      // Finalize subagent live block (independent from main agent live block)
+      if (this._liveSubagentBlock) {
+        this._liveSubagentBlock.style.opacity = ''
+        this._liveSubagentBlock = null
+      }
+
+      const isVisible = getSubagentActivityVisible()
+      const msg = event.message
+      if (!msg || !Array.isArray(msg.content)) return
+
+      // Root D risk: only clear liveToolBlocks that belong to this subagent level
+      // (those marked with data-subagent-parent), not main agent tool blocks
+      if (this._liveToolBlocks && this._liveToolBlocks.size > 0) {
+        const parentId = event.parent_tool_use_id
+        for (const [toolId, block] of this._liveToolBlocks.entries()) {
+          if (block && block.dataset.subagentParent === parentId) {
+            if (block.parentNode) block.parentNode.removeChild(block)
+            this._liveToolBlocks.delete(toolId)
+          }
+        }
+      }
+
+      // Render each content part as an activity block
+      for (const part of msg.content) {
+        if (part.type === 'text') {
+          if (!part.text?.trim()) continue
+          const article = this._makeBlock('cbr-block-subagent-activity')
+          if (!isVisible) article.style.display = 'none'
+          let html
+          try { html = renderMarkdown(part.text) } catch { html = `<p>${escHtml(part.text)}</p>` }
+          article.innerHTML =
+            `<div class="cbr-subagent-activity-label">subagent response</div>` +
+            `<div class="cbr-text">${html}</div>`
+          this._scroll.appendChild(article)
+          this._scrollBottom()
+        } else if (part.type === 'tool_use') {
+          // Subagent's own tool calls — render as activity block
+          const article = this._renderToolUsePart(part, { subagentActivity: true, visible: isVisible })
+          if (article) {
+            article.dataset.subagentParent = event.parent_tool_use_id
+          }
+        }
+      }
+      return
+    }
+
+    // ── Main agent assistant ────────────────────────────────────────────────────
+
+    // N47/N52 fix: remove the live assistant block from DOM (not just null the
+    // reference). Previously, only the JS reference was cleared; the live DOM
+    // element stayed, causing either:
+    //   • Duplicate text1 (live partial + final rendered text)
+    //   • Ghost empty block with cbr-live border when partial was empty
+    //   • text1 appearing BEFORE the tool placeholder if partial streamed ahead
+    // Now we physically remove it so the final _renderContentPart calls produce
+    // a clean, ordered DOM with no stale fragments.
+    if (this._liveAssistantBlock && this._liveAssistantBlock.parentNode) {
+      this._liveAssistantBlock.parentNode.removeChild(this._liveAssistantBlock)
+    }
+    this._liveAssistantBlock = null
+    this._liveAssistantId = null
+
+    // Root D: clear live tool block map — only non-subagent tool blocks
+    // (subagent tool blocks are marked with data-subagent-parent and handled above)
+    if (this._liveToolBlocks && this._liveToolBlocks.size > 0) {
+      for (const [toolId, block] of this._liveToolBlocks.entries()) {
+        // Only remove blocks that are NOT subagent-owned
+        if (block && !block.dataset.subagentParent) {
+          if (block.parentNode) block.parentNode.removeChild(block)
+          this._liveToolBlocks.delete(toolId)
+        }
+      }
+    }
+
+    const msg = event.message
+    if (!msg || !Array.isArray(msg.content)) return
+
+    for (const part of msg.content) {
+      this._renderContentPart(part, /* live= */ false)
+    }
+  }
+
+  _handlePartialMessage(event) {
+    // Root F fix: do NOT return early for subagent partials even when activity toggle is off.
+    // Build DOM with display:none so toggle can reveal blocks that already streamed through.
+    const isSubagentPartial = !!event.parent_tool_use_id
+
+    // partial_message carries a partial assistant message object
+    const msg = event.message
+    if (!msg || !Array.isArray(msg.content)) return
+
+    const parts = msg.content
+
+    // Root D: handle tool_use partials — show loading placeholder while streaming
+    // We track live loading blocks by tool id in _liveToolBlocks map
+    if (!this._liveToolBlocks) this._liveToolBlocks = new Map()
+
+    const isVisible = isSubagentPartial ? getSubagentActivityVisible() : true
+
+    for (const part of parts) {
+      if (part.type === 'tool_use') {
+        const toolId = part.id
+        if (!toolId) continue
+        if (!this._liveToolBlocks.has(toolId)) {
+          // Create loading placeholder (input may be partial/incomplete JSON — safe to pass)
+          const safePart = { name: part.name || 'tool', id: toolId, input: null }
+          // Try to parse input if present (partial_json may arrive as a partial object)
+          if (part.input != null) {
+            try {
+              // input is already parsed by Claude CLI if it's an object; just use it
+              safePart.input = (typeof part.input === 'object') ? part.input : JSON.parse(part.input)
+            } catch {
+              safePart.input = null  // still incomplete JSON — stay loading
+            }
+          }
+          const loadBlock = this._renderToolUsePart(safePart, {
+            loading: safePart.input == null,
+            subagentActivity: isSubagentPartial,
+            visible: isVisible,
+          })
+          if (loadBlock && isSubagentPartial) {
+            loadBlock.dataset.subagentParent = event.parent_tool_use_id
+          }
+          this._liveToolBlocks.set(toolId, loadBlock)
+        }
+        // Note: we don't update the block on each delta — the final `assistant` event
+        // will render the completed tool_use block (or _handleAssistant will replace
+        // the live block). The loading placeholder just provides immediate feedback.
+      }
+    }
+
+    if (isSubagentPartial) {
+      // Subagent partial text: update/create a single reused live subagent activity block
+      // (risk point 4: reuse same block, don't create one per chunk)
+      if (parts.length >= 1 && parts[0].type === 'text') {
+        const text = parts[0].text || ''
+        if (text.trim()) {
+          if (!this._liveSubagentBlock) {
+            const article = this._makeBlock('cbr-block-subagent-activity cbr-live')
+            if (!isVisible) article.style.display = 'none'
+            article.style.opacity = '0.7'
+            article.innerHTML = `<div class="cbr-subagent-activity-label">subagent streaming…</div><div class="cbr-subagent-stream-body"></div>`
+            this._scroll.appendChild(article)
+            this._liveSubagentBlock = article
+            this._scrollBottom()
+          }
+          const bodyEl = this._liveSubagentBlock.querySelector('.cbr-subagent-stream-body')
+          if (bodyEl) {
+            let html
+            // P3-1: streaming render — guard unclosed fences
+            try { html = renderMarkdown(text, { streaming: true }) } catch { html = `<p>${escHtml(text)}</p>` }
+            bodyEl.innerHTML = html
+          }
+          this._scrollBottom()
+        }
+      }
+      return
+    }
+
+    // N52 fix: live-update the text part of a partial message even when there
+    // are additional non-text parts (e.g. tool_use being streamed alongside
+    // commentary text). Previously the condition required EXACTLY one text part
+    // with no other parts; any mixed content was silently skipped, leaving text1
+    // invisible during streaming (showing only after the final assistant event).
+    // Now: extract the FIRST text part from any partial (regardless of other
+    // parts in the same message) and keep the live text block updated.
+    const firstTextPart = parts.find((p) => p.type === 'text')
+    if (firstTextPart) {
+      const text = firstTextPart.text || ''
+      if (!this._liveAssistantBlock) {
+        const article = this._makeBlock('cbr-block-text cbr-live')
+        this._scroll.appendChild(article)
+        this._liveAssistantBlock = article
+        this._scrollBottom()
+      }
+      // Perf: throttle markdown re-render to one rAF per frame instead of
+      // running marked.parse() + innerHTML on every incoming WS chunk.
+      // Store the latest text; the pending rAF will pick it up when it fires.
+      this._streamPendingText = text
+      if (!this._streamRafPending) {
+        this._streamRafPending = true
+        requestAnimationFrame(() => {
+          this._streamRafPending = false
+          const latestText = this._streamPendingText
+          if (!latestText || !this._liveAssistantBlock) return
+          // P1-5: skip frozen blocks — they are finalized and don't need re-render
+          if (this._liveAssistantBlock.dataset.frozen === '1') return
+          let html
+          // P3-1: pass streaming:true so unclosed ``` fences are trimmed before parse
+          try { html = renderMarkdown(latestText, { streaming: true }) } catch { html = `<p>${escHtml(latestText)}</p>` }
+          this._liveAssistantBlock.innerHTML = `<div class="cbr-text">${html}</div>`
+          // Smart auto-scroll: only scroll if user has not scrolled up
+          if (!this._userScrolledUp) {
+            const s = this._scroll
+            s.scrollTop = s.scrollHeight
+          }
+          this._updateScrollBtn()
+        })
+      }
+    }
+  }
+
+  _handleResult(event) {
+    // Subagent result: do NOT trigger main-turn end-of-turn logic.
+    // Subagents emit their own 'result' events (parent_tool_use_id is set).
+    // These must NOT call _setThinking(false), dispatch nanocode:turn-complete,
+    // or clear/flush main-turn live blocks — the main turn is still in progress.
+    // Visual wrap-up of the subagent live block is already handled in
+    // _handleAssistant (isSubagentAssistant branch). Just bail out here.
+    if (event.parent_tool_use_id) {
+      // Clean up any lingering subagent live block
+      if (this._liveSubagentBlock) {
+        this._liveSubagentBlock.style.opacity = ''
+        this._liveSubagentBlock = null
+      }
+      return
+    }
+
+    // End-of-turn: flush live blocks, exit thinking state.
+    // N47/N52 fix: also physically remove the live assistant block from DOM
+    // (see parallel fix in _handleAssistant). When claude --print sends an
+    // error result without a preceding assistant event, the live block might
+    // still be in DOM. Remove it here so no stale cbr-live element lingers.
+    if (this._liveAssistantBlock && this._liveAssistantBlock.parentNode) {
+      this._liveAssistantBlock.parentNode.removeChild(this._liveAssistantBlock)
+    }
+    this._liveAssistantBlock = null
+    this._liveAssistantId = null
+    if (this._liveSubagentBlock) {
+      this._liveSubagentBlock.style.opacity = ''
+      this._liveSubagentBlock = null
+    }
+    // P1-5: freeze all live assistant blocks that are now complete so rAF
+    // callbacks skip re-running marked.parse() on already-finalized content.
+    this._scroll.querySelectorAll('.cbr-block-text.cbr-live').forEach((el) => {
+      el.dataset.frozen = '1'
+      el.classList.remove('cbr-live')
+    })
+    // Compute elapsed before clearing thinking state
+    const elapsed = this._turnStartTime != null ? Date.now() - this._turnStartTime : 0
+    this._turnStartTime = null
+    this._setThinking(false)
+
+    // Dispatch turn-complete event for the notification system (app.js listens).
+    // Fired for every result, regardless of elapsed — app.js applies the threshold.
+    document.dispatchEvent(new CustomEvent('nanocode:turn-complete', {
+      detail: { tabId: this.tabId, elapsed },
+    }))
+
+    if (event.subtype === 'success' || event.subtype === 'error_max_turns') {
+      const usage = event.usage
+      if (usage) {
+        const parts = []
+        if (usage.input_tokens != null) parts.push(`in ${usage.input_tokens}`)
+        if (usage.output_tokens != null) parts.push(`out ${usage.output_tokens}`)
+        if (usage.cache_read_input_tokens != null) parts.push(`cache_read ${usage.cache_read_input_tokens}`)
+        if (event.cost_usd != null) parts.push(`$${Number(event.cost_usd).toFixed(4)}`)
+        if (parts.length) {
+          const article = this._makeBlock('cbr-block-usage')
+          article.innerHTML = `<p class="cbr-usage">${escHtml(parts.join(' · '))}</p>`
+          this._scroll.appendChild(article)
+          this._scrollBottom()
+        }
+      }
+    } else if (event.subtype === 'error') {
+      this._addSystemBlock(`[Error: ${event.error?.message || 'unknown error'}]`)
+    }
+  }
+
+  _handleRateLimit(event) {
+    const info = event.rate_limit_info || {}
+    const msg = info.retryAfterMs
+      ? `Rate limited — retry in ${(info.retryAfterMs / 1000).toFixed(0)}s`
+      : 'Rate limit warning'
+    // Show as a transient toast-like system block
+    const article = this._makeBlock('cbr-block-system cbr-rate-limit')
+    article.innerHTML = `<p class="cbr-system">[${escHtml(msg)}]</p>`
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  // ── Content rendering ──────────────────────────────────────────────────────
+
+  _renderContentPart(part, live = false) {
+    if (!part) return
+    if (part.type === 'text') {
+      this._renderTextPart(part.text || '', live)
+    } else if (part.type === 'thinking') {
+      // P1-6: render thinking block as a collapsible faded panel
+      this._renderThinkingPart(part.thinking || '')
+    } else if (part.type === 'tool_use') {
+      this._renderToolUsePart(part)
+    } else if (part.type === 'tool_result') {
+      this._renderToolResultPart(part)
+    }
+  }
+
+  _renderThinkingPart(text) {
+    if (!text) return
+    const article = createThinkingBlock(text, { escHtml })
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  _renderTextPart(text, live) {
+    if (!text.trim()) return
+    const article = createTextBlock(text, {
+      live,
+      renderMarkdown,
+      escHtml,
+      attachCopyHandlers,
+      attachPathAndUrlHandlers,
+    })
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  _renderToolUsePart(part, opts = {}) {
+    // ── Subagent prompt detection ─────────────────────────────────────────────
+    // The Agent tool (and TaskCreate in some versions) represents dispatching a
+    // subagent. Its input.prompt is the message we send to the subagent.
+    // We also detect codex dispatches heuristically: a Bash tool_use whose command
+    // contains "codex" or dispatches via tmux is treated as a subagent invocation
+    // for toggle purposes. This is best-effort; a plain Bash tool running an
+    // unrelated tmux command would not normally contain "codex" in its context.
+    const isSubagentTool = part.name === 'Agent' || part.name === 'Task' || part.name === 'TaskCreate'
+    const isBashCodexDispatch = part.name === 'Bash' && (
+      (typeof part.input?.command === 'string' && /codex|dispatch.codex/i.test(part.input.command))
+    )
+    const isSubagentPrompt = isSubagentTool || isBashCodexDispatch
+
+    // Root D: partial/loading state — input may be partial JSON or null
+    const isLoading = opts.loading === true
+
+    // Root F: subagentActivity flag means this tool block belongs to subagent internals
+    // (not the prompt sent TO the subagent, but the subagent's own tool calls)
+    const isSubagentActivity = opts.subagentActivity === true
+    // visible: for subagent activity blocks, whether the activity toggle is on
+    // (undefined means don't control visibility — for main agent blocks)
+    const activityVisible = opts.visible
+
+    let inputHtml = ''
+    if (isLoading) {
+      inputHtml = `<div class="cbr-tool-loading">running…</div>`
+    } else if (part.input != null) {
+      if (isSubagentTool) {
+        // For subagent tools, show prompt and description in a more readable way
+        const prompt = part.input.prompt || ''
+        const description = part.input.description || ''
+        if (description) {
+          inputHtml += `<div class="cbr-subagent-desc">${escHtml(description)}</div>`
+        }
+        if (prompt) {
+          inputHtml += `<pre class="cbr-pre cbr-subagent-prompt-text">${escHtml(prompt.slice(0, 3000))}${prompt.length > 3000 ? '\n…' : ''}</pre>`
+        }
+        if (!description && !prompt) {
+          try {
+            inputHtml = renderCode(JSON.stringify(part.input, null, 2), 'json')
+          } catch {
+            inputHtml = `<pre class="cbr-pre"><code>${escHtml(String(part.input))}</code></pre>`
+          }
+        }
+      } else if (part.name === 'Edit') {
+        // P1-1: Edit tool — render old_string/new_string as red/green diff
+        const filePath = part.input.file_path || part.input.path || ''
+        const oldStr = part.input.old_string != null ? String(part.input.old_string) : ''
+        const newStr = part.input.new_string != null ? String(part.input.new_string) : ''
+        inputHtml = renderEditDiff(filePath, oldStr, newStr)
+      } else if (part.name === 'Write') {
+        // P1-1: Write tool — render file_path + content as green new-file preview
+        const filePath = part.input.file_path || part.input.path || ''
+        const content = part.input.content != null ? String(part.input.content) : ''
+        inputHtml = renderWritePreview(filePath, content)
+      } else if (part.name === 'MultiEdit') {
+        // P1-1: MultiEdit — each edit block rendered as a separate diff
+        const filePath = part.input.file_path || part.input.path || ''
+        const edits = Array.isArray(part.input.edits) ? part.input.edits : []
+        if (edits.length === 0) {
+          try {
+            inputHtml = renderCode(JSON.stringify(part.input, null, 2), 'json')
+          } catch {
+            inputHtml = `<pre class="cbr-pre"><code>${escHtml(String(part.input))}</code></pre>`
+          }
+        } else {
+          inputHtml = edits.map((edit, idx) => {
+            const oldStr = edit.old_string != null ? String(edit.old_string) : ''
+            const newStr = edit.new_string != null ? String(edit.new_string) : ''
+            const editPath = edit.file_path || filePath || ''
+            return `<div class="cbr-multiedit-hunk">` +
+              (edits.length > 1 ? `<div class="cbr-multiedit-hunk-label">Edit ${idx + 1} of ${edits.length}</div>` : '') +
+              renderEditDiff(editPath, oldStr, newStr) +
+              `</div>`
+          }).join('')
+        }
+      } else {
+        try {
+          const pretty = JSON.stringify(part.input, null, 2)
+          inputHtml = renderCode(pretty, 'json')
+        } catch {
+          inputHtml = `<pre class="cbr-pre"><code>${escHtml(String(part.input))}</code></pre>`
+        }
+      }
+    }
+
+    // P2-1: prepend tool icon if available (inline SVG, 16×16)
+    const toolIcon = getToolIcon(part.name || '')
+    const article = createToolUseBlock({
+      part,
+      inputHtml,
+      toolIcon,
+      isLoading,
+      isSubagentTool,
+      isSubagentPrompt,
+      isSubagentActivity,
+      activityVisible,
+      getSubagentPromptVisible,
+      applyToolFold,
+      getToolFoldLevel,
+      cycleToolFold,
+      attachCopyHandlers,
+      escHtml,
+    })
+    stampToolUseIdentity(article, part.id)
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+    return article
+  }
+
+  _renderToolResultPart(part, opts = {}) {
+    const isSubagentActivity = opts.subagentActivity === true
+    const activityVisible = opts.visible
+    const { resultHtml, isError } = buildToolResultHtml(part, { escHtml })
+
+    const paired = pairToolResult({
+      scrollRoot: this._scroll,
+      toolUseId: part.tool_use_id,
+      resultHtml,
+      isError,
+      attachCopyHandlers,
+    })
+
+    if (paired) return
+
+    const article = createStandaloneToolResultBlock({
+      resultHtml,
+      isSubagentActivity,
+      activityVisible,
+      applyToolFold,
+      cycleToolFold,
+    })
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  // ── Utility blocks ─────────────────────────────────────────────────────────
+
+  _makeBlock(extraClasses = '') {
+    const article = document.createElement('article')
+    article.className = `cbr-block ${extraClasses}`.trim()
+    return article
+  }
+
+  _addSystemBlock(msg) {
+    const article = createSystemBlock(msg, { escHtml })
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+    return article
+  }
+
+  _addSdkFallbackBanner(text) {
+    const article = document.createElement('article')
+    article.className = 'cbr-block cbr-block-sdk-fallback'
+    article.innerHTML = `<div class="cbr-sdk-fallback-banner">
+      <span class="cbr-sdk-fallback-icon">&#9888;</span>
+      <span class="cbr-sdk-fallback-text">${escHtml(text || 'SDK error — 已自动切回 CLI 这一 turn')}</span>
+    </div>`
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+    return article
+  }
+
+  _appendUserBlock(text) {
+    const article = createUserBlock(text, { escHtml, attachPathAndUrlHandlers })
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  _appendSkillLoadBlock(text) {
+    const article = createSkillLoadBlock(text, { escHtml })
+    this._scroll.appendChild(article)
+    this._scrollBottom()
+  }
+
+  _scrollBottom({ force = false } = {}) {
+    // During replay, skip per-block rAF scroll — _fetchAndReplayHistory does one at the end
+    if (this._replayMode) return
+    // Smart auto-scroll: if the user has scrolled up, do NOT auto-scroll (unless forced)
+    if (!force && this._userScrolledUp) return
+    requestAnimationFrame(() => {
+      this._scroll.scrollTop = this._scroll.scrollHeight
+      // After programmatic scroll, re-evaluate button visibility
+      this._updateScrollBtn()
+    })
+  }
+}
+
+// Export fold helpers and subagent visibility helpers so settings panel (app.js) can wire them up
+export {
+  getToolFoldLevel, setToolFoldLevel, TOOL_FOLD_LEVELS,
+  getSubagentPromptVisible, setSubagentPromptVisible,
+  getSubagentActivityVisible, setSubagentActivityVisible,
+}
