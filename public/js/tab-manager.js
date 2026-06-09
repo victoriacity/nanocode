@@ -10,9 +10,26 @@
  */
 
 import { TerminalPane } from './terminal-pane.js'
-import { ClaudeBlockRenderer } from './claude-block-renderer.js'
-import { CodexBlockRenderer } from './codex-block-renderer.js'
 import { fetchTabs, createTab, deleteTab, patchTab } from './api.js'
+
+// Block renderers (claude-block-renderer.js ~94 KB, codex-block-renderer.js
+// ~57 KB raw — 41 KB gz combined) are loaded LAZILY. Most users default
+// to the terminal renderer (renderMode='terminal'), so we don't ship
+// these on cold start. Cached once per module after first load.
+let _claudeBlockPromise = null
+let _codexBlockPromise = null
+function loadClaudeBlock() {
+  if (!_claudeBlockPromise) {
+    _claudeBlockPromise = import('./claude-block-renderer.js').then((m) => m.ClaudeBlockRenderer)
+  }
+  return _claudeBlockPromise
+}
+function loadCodexBlock() {
+  if (!_codexBlockPromise) {
+    _codexBlockPromise = import('./codex-block-renderer.js').then((m) => m.CodexBlockRenderer)
+  }
+  return _codexBlockPromise
+}
 
 const ACTIVE_KEY_PREFIX = 'activeTab:'
 
@@ -377,16 +394,26 @@ export class TabManager {
     const codexRenderMode = (() => { try { return window.__nanocodeState?.codexRenderMode || 'terminal' } catch { return 'terminal' } })()
     const useClaudeRenderer = type === 'claude' && renderMode === 'block'
     const useCodexRenderer = type === 'codex' && codexRenderMode === 'block'
-    let pane
-    if (useClaudeRenderer) {
-      pane = new ClaudeBlockRenderer(paneEl, paneOpts)
-    } else if (useCodexRenderer) {
-      pane = new CodexBlockRenderer(paneEl, paneOpts)
-    } else {
-      pane = new TerminalPane(paneEl, paneOpts)
-    }
-
+    // Synchronous default: PTY renderer. Block renderers are loaded
+    // lazily and swapped in once the module arrives. While the JS
+    // streams in, the placeholder TerminalPane keeps the WS attached
+    // so no terminal state is lost; we tear it down right before
+    // installing the block renderer on the same element.
+    let pane = new TerminalPane(paneEl, paneOpts)
     this.tabs.push({ id, label, type, pane, paneEl })
+
+    if (useClaudeRenderer || useCodexRenderer) {
+      const loader = useClaudeRenderer ? loadClaudeBlock() : loadCodexBlock()
+      loader.then((Cls) => {
+        const tab = this.tabs.find((t) => t.id === id)
+        if (!tab) return
+        try { tab.pane.dispose() } catch {}
+        paneEl.innerHTML = ''
+        tab.pane = new Cls(paneEl, paneOpts)
+      }).catch((err) => {
+        console.error('[tab-manager] failed to load block renderer:', err)
+      })
+    }
     // Track grew; keep the visible position pinned to the active tab.
     this._syncTrackPosition({ noAnim: true })
   }
