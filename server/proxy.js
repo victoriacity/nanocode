@@ -31,11 +31,21 @@ import http from 'node:http'
 // keepAlive=true reuses warm sockets — no thundering herd. maxSockets
 // caps the worker's concurrent inbound at a value its accept queue can
 // drain comfortably. maxFreeSockets keeps the pool warm between pages.
+// `timeout` MUST be shorter than the worker's server.keepAliveTimeout
+// (Node + Express default: 5s). Otherwise the worker silently closes
+// idle sockets while the agent still considers them fresh, the next
+// request writes to a dead socket and gets ECONNRESET. With 4s here
+// the agent always reaps first, the next request opens a fresh socket,
+// and no ECONNRESET escapes the proxy layer.
+//
+// On worker code that's been updated to set a longer keepAliveTimeout
+// (recommended: 120s), this 4s is still safe — it just means the pool
+// recycles a little more often than strictly necessary.
 const agent = new http.Agent({
   keepAlive: true,
   maxSockets: 64,
   maxFreeSockets: 16,
-  timeout: 30_000,
+  timeout: 4_000,
 })
 
 // Idempotent methods are safe to retry on a connection-reset error
@@ -43,12 +53,22 @@ const agent = new http.Agent({
 // never established or got RST before the request body was sent).
 const RETRYABLE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE'])
+const MAX_RETRIES = 3
+// Tiny back-off between retries — gives the keep-alive pool a moment
+// to reap any other stale sockets so the next attempt isn't pulling
+// from the same poisoned set.
+const RETRY_DELAY_MS = [0, 25, 75]
 
 /**
- * Forward an incoming http req/res to the user's worker. One retry
- * on connection-level failures for idempotent methods.
+ * Forward an incoming http req/res to the user's worker.
+ * Up to MAX_RETRIES connection-level retries for idempotent methods.
  */
 export function proxyHttp(req, res, workerSock, user) {
+  // For methods we can't retry safely, the request body must reach
+  // the worker on the first attempt. For idempotent methods on which
+  // the body is rare (mostly GETs), we still pipe it — the retry
+  // logic only fires when the body hasn't been sent yet (which means
+  // the worker can't have seen it), so retry-and-re-pipe is safe.
   attempt(0)
 
   function attempt(tries) {
@@ -72,12 +92,13 @@ export function proxyHttp(req, res, workerSock, user) {
 
     proxyReq.on('error', (err) => {
       const retryable =
-        tries < 1 &&
+        tries < MAX_RETRIES &&
         !res.headersSent &&
         RETRYABLE_METHODS.has(req.method) &&
         RETRYABLE_CODES.has(err.code)
       if (retryable) {
-        return attempt(tries + 1)
+        const delay = RETRY_DELAY_MS[Math.min(tries, RETRY_DELAY_MS.length - 1)]
+        return setTimeout(() => attempt(tries + 1), delay)
       }
       if (!res.headersSent) {
         res.statusCode = 502
