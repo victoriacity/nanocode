@@ -88,8 +88,16 @@ if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
   document.fonts.ready.then(() => {
     for (const pane of PANES) {
       try {
-        pane.term.options.letterSpacing = 0.001
-        pane.term.options.letterSpacing = 0
+        // fontSize toggle is the most reliable public-API remeasure
+        // trigger — it ALWAYS fires the option-change event (xterm
+        // recomputes both cellWidth AND cellHeight when fontSize
+        // changes), even if the numeric value differs by less than a
+        // pixel. letterSpacing/fontFamily toggles were both being
+        // short-circuited in 5.5. The +1 / restore round-trip happens
+        // within a single frame so the visible glitch is sub-perceptible.
+        const fs = pane.term.options.fontSize
+        pane.term.options.fontSize = fs + 1
+        pane.term.options.fontSize = fs
         pane._fit()
       } catch {}
     }
@@ -141,6 +149,14 @@ export class TerminalPane {
       scrollback: mobile ? 2000 : 4000,
       cursorBlink: true,
       allowProposedApi: true,
+      // OSC 8 hyperlinks (some programs, including claude code, wrap URLs
+      // in OSC 8 markers instead of relying on link autodetection). xterm
+      // needs an explicit handler to make them clickable.
+      linkHandler: {
+        activate(_event, uri) {
+          try { window.open(uri, '_blank', 'noopener,noreferrer') } catch {}
+        },
+      },
     })
     PANES.add(this)
 
@@ -166,6 +182,32 @@ export class TerminalPane {
 
     // Open in container
     this.term.open(container)
+
+    // OSC 52 — programmatic clipboard write. Claude Code's "press c to
+    // copy URL" prompt emits `ESC ] 52 ; c ; <base64-of-text> BEL`. The
+    // worker has no system clipboard (headless), so the sequence has to
+    // be handled here on the browser side and routed through the user's
+    // browser clipboard. xterm.js doesn't enable OSC 52 by default for
+    // security reasons (a remote program writing the user's clipboard
+    // is a real risk on a multi-user host), but in nanocode the only
+    // program writing to the PTY is one the user explicitly launched,
+    // so the trust model already covers it.
+    try {
+      this.term.parser.registerOscHandler(52, (data) => {
+        // Payload format: <selection>;<base64-data>
+        // - selection: c=clipboard, p=primary, q,s=others. We treat all as clipboard.
+        // - data == '?'  → read request; refuse (we won't echo the user's clipboard back).
+        const sep = data.indexOf(';')
+        if (sep < 0) return true
+        const payload = data.slice(sep + 1)
+        if (payload === '?' || payload === '') return true
+        try {
+          const text = atob(payload)
+          if (text) navigator.clipboard.writeText(text).catch(() => {})
+        } catch {}
+        return true   // we handled it; don't let xterm pass to default
+      })
+    } catch {}
 
     // Mobile: fix touch scrolling — xterm.js sets inline touch-action:none on
     // .xterm-screen which blocks all touch gestures. Override it and add manual
