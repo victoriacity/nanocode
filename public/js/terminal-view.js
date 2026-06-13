@@ -1376,8 +1376,19 @@ function setupChatInput() {
       if (!activePane) return
       switch (action) {
         case 'ctrl-c':
-          // Same logic as keyboard Ctrl+C: clear input if has text, else interrupt/sendRaw
-          if (chatInput.value) {
+          // Touch-toolbar Ctrl+C:
+          //   1. If xterm has a selection → copy it to the clipboard (mobile
+          //      users have no keyboard shortcut; this is their only path).
+          //   2. Else if the composer has text → clear it.
+          //   3. Else if claude is thinking → interrupt the turn.
+          //   4. Else → send raw \x03 to the PTY.
+          if (activePane.term?.hasSelection?.()) {
+            const sel = activePane.term.getSelection?.()
+            if (sel) {
+              try { navigator.clipboard.writeText(sel) } catch {}
+            }
+            activePane.term.clearSelection?.()
+          } else if (chatInput.value) {
             chatInput.value = ''; autoResize()
           } else if (isClaudeTab && isClaudeThinking) {
             doInterrupt()

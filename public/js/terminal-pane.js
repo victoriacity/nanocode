@@ -72,20 +72,24 @@ document.addEventListener('nanocode:theme', () => {
   }
 })
 
-// Defense in depth: if the JetBrains Mono webfont arrives AFTER xterm has
-// already measured its cellWidth (rare with font-display: block, but
-// possible during the block period or on very slow connections), force
-// every live xterm to remeasure + refit. Reassigning fontFamily to the
-// same value triggers xterm's option-change handler which re-measures the
-// monospace cell size against the (now-loaded) real font; the follow-up
-// _fit() then recomputes cols/rows so nothing overshoots.
+// When the JetBrains Mono webfont arrives AFTER xterm has already measured
+// its cellWidth against the fallback monospace, every live xterm needs to
+// remeasure and refit — otherwise the cached fallback cellWidth × cols ends
+// up wider than the pane and the last character of each line clips.
+//
+// Toggling `letterSpacing` is the most reliable public-API trigger:
+// xterm's option-change handler invalidates the cached char dimensions
+// and forces the renderer to remeasure the .xterm-char-measure-element
+// (which now uses the loaded webfont). Setting it back to 0 returns the
+// rendering to the canonical state with the new measurements applied.
+// fontFamily toggling was unreliable — xterm short-circuits the change
+// event when the new family string parses to the same first font.
 if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
   document.fonts.ready.then(() => {
     for (const pane of PANES) {
       try {
-        const family = pane.term.options.fontFamily
-        pane.term.options.fontFamily = family + ' '   // change → forces remeasure
-        pane.term.options.fontFamily = family         // restore canonical value
+        pane.term.options.letterSpacing = 0.001
+        pane.term.options.letterSpacing = 0
         pane._fit()
       } catch {}
     }
@@ -142,7 +146,18 @@ export class TerminalPane {
 
     this.fitAddon = new FitAddon()
     this.term.loadAddon(this.fitAddon)
-    this.term.loadAddon(new WebLinksAddon())
+    // Custom URL handler: nanocode runs in a browser, so the workers don't
+    // have a system clipboard or an `xdg-open`-equivalent. When the user
+    // taps a URL in the terminal we open it in a real browser tab and
+    // strip opener so the new tab can't reach back into this origin.
+    // `window.open(uri, '_blank', 'noopener,noreferrer')` is more
+    // reliable than the addon's default `window.open()` + location.href
+    // dance, which iOS Safari sometimes blocks as a synthetic popup.
+    this.term.loadAddon(
+      new WebLinksAddon((_event, uri) => {
+        window.open(uri, '_blank', 'noopener,noreferrer')
+      })
+    )
 
     // Local echo for high-latency: show typed chars immediately, reconcile with server output
     this.localEcho = new LocalEcho({
@@ -190,9 +205,10 @@ export class TerminalPane {
       this._send({ type: 'input', data })
     })
 
-    // Paste handler — Ctrl+V / Ctrl+Shift+V
+    // Paste / copy handlers.
     this._keyDisposable = this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
+      // Ctrl+V / Cmd+V — paste from system clipboard into the PTY.
       if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) {
         navigator.clipboard
           .readText()
@@ -201,6 +217,25 @@ export class TerminalPane {
           })
           .catch(() => {})
         return false
+      }
+      // Copy semantics:
+      //   Ctrl+Shift+C / Cmd+Shift+C → ALWAYS copy current selection, never
+      //   forward to the PTY. The standard terminal convention.
+      //   Ctrl+C / Cmd+C with an active selection → copy the selection and
+      //   suppress \x03 so the running program doesn't get interrupted.
+      //   Ctrl+C / Cmd+C with no selection → fall through (xterm sends \x03).
+      const isCopyChord =
+        (e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')
+      if (isCopyChord) {
+        const wantsExplicitCopy = e.shiftKey
+        const hasSelection = this.term.hasSelection && this.term.hasSelection()
+        if (wantsExplicitCopy || hasSelection) {
+          const sel = this.term.getSelection ? this.term.getSelection() : ''
+          if (sel) {
+            try { navigator.clipboard.writeText(sel) } catch {}
+          }
+          return false
+        }
       }
       return true
     })
