@@ -212,7 +212,7 @@ export function startRouterMode({
   // no-cache header on assets pinned before the v2 flush — re-firing
   // Clear-Site-Data once on the next page load gives every browser
   // a clean slate for the v1.3.0 mobile-composer fixes.
-  const CACHE_BUST_COOKIE = 'nano_cache_bust_v3'
+  const CACHE_BUST_COOKIE = 'nano_cache_bust_v4'
   app.use((req, res, next) => {
     const urlPath = (req.url || '').split('?')[0]
     if (urlPath !== '/' && urlPath !== '/index.html') return next()
