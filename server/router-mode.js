@@ -234,16 +234,24 @@ export function startRouterMode({
     next()
   })
 
-  // App code (/js/*, /style.css, /index.html) must revalidate on every
-  // page load so a deploy reaches browsers without a hard-refresh.
-  // ETag-based 304 Not Modified makes this cheap.
+  // App code (/js/*, /style.css, /index.html) must NEVER be served from
+  // the browser cache while we're iterating on mobile-composer / xterm
+  // fixes — `no-cache, must-revalidate` was supposed to force ETag
+  // revalidation but at least one browser-cache layer in the user's
+  // path keeps serving stale assets anyway. `no-store` is the nuclear
+  // option: the browser is forbidden to cache the response at all,
+  // each page load fetches fresh bytes. Cost is one extra network
+  // round-trip per asset; over a fast tailnet it's measured in ms.
+  // Once the UX is stable we can downgrade back to no-cache+ETag.
   app.use(express.static(ASSET_DIR, {
     etag: true,
     lastModified: true,
     cacheControl: true,
     maxAge: 0,
     setHeaders(res) {
-      res.setHeader('Cache-Control', 'no-cache, must-revalidate')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader('Pragma', 'no-cache')
+      res.setHeader('Expires', '0')
     },
   }))
   // Vendor libs (node_modules/* and public/vendor/*) are content-
