@@ -208,7 +208,11 @@ export function startRouterMode({
   // so each browser sees it exactly once — next load is fresh,
   // every subsequent load is normal. Only fires on the index.html
   // load (else we'd loop the bust on every asset fetch).
-  const CACHE_BUST_COOKIE = 'nano_cache_bust_v2'
+  // Cookie name bumped (v2 → v3) because some browsers ignored the
+  // no-cache header on assets pinned before the v2 flush — re-firing
+  // Clear-Site-Data once on the next page load gives every browser
+  // a clean slate for the v1.3.0 mobile-composer fixes.
+  const CACHE_BUST_COOKIE = 'nano_cache_bust_v3'
   app.use((req, res, next) => {
     const urlPath = (req.url || '').split('?')[0]
     if (urlPath !== '/' && urlPath !== '/index.html') return next()

@@ -1277,8 +1277,11 @@ function setupChatInput() {
         // Priority 4: clear input
         chatInput.value = ''
         autoResize()
-      } else if (!isClaudeTab && activePane) {
-        // Bash/codex tab: send raw Escape to PTY
+      } else if (activePane) {
+        // Fall-through: send raw ESC to the PTY (claude/codex/bash all
+        // benefit — claude's /login prompt cancels on ESC, codex menus
+        // close, vim leaves insert mode). Previously gated by
+        // `!isClaudeTab`, which left Esc dead on an idle claude tab.
         activePane.sendRaw('\x1b')
       }
       e.preventDefault()
@@ -1413,23 +1416,17 @@ function setupChatInput() {
         case 'tab':
           activePane.sendRaw('\t'); break
         case 'escape':
-          // Same priority logic as keyboard Esc. The final branch is
-          // UNCONDITIONAL: when no UI-level branch matches, ESC must
-          // always reach the PTY (vim, claude's own interactive prompts,
-          // codex menus, etc.). The earlier guard `!isClaudeTab` swallowed
-          // ESC on a claude tab with empty input + not-thinking, leaving
-          // the mobile Esc button dead in that state.
-          if (claudeSlashOpen) {
-            hideSlashCommands()
-          } else if (suggestionsOpen) {
-            hideSuggestions()
-          } else if (isClaudeTab && isClaudeThinking) {
-            doInterrupt()
-          } else if (chatInput.value) {
-            chatInput.value = ''; autoResize()
-          } else {
-            activePane.sendRaw('\x1b')
-          }
+          // Mobile Esc behaves like a hardware Esc key: always send
+          // the raw byte to the PTY. Same shape as the 'tab' button
+          // above. Users tap this because they want claude / vim / a
+          // codex menu / etc. to RECEIVE an ESC. Interruption of a
+          // running turn is the Stop button's job, not Esc's — the
+          // Stop button is visible whenever isClaudeThinking is true.
+          // Previously we routed through doInterrupt() on a thinking
+          // claude tab, which sends SIGINT — that kills the turn but
+          // does NOT deliver the ESC byte, so cancelling the /login
+          // URL prompt was impossible from the mobile button.
+          activePane.sendRaw('\x1b')
           break
       }
       if (document.activeElement === chatInput) chatInput.focus()
