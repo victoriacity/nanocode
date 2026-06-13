@@ -72,6 +72,26 @@ document.addEventListener('nanocode:theme', () => {
   }
 })
 
+// Defense in depth: if the JetBrains Mono webfont arrives AFTER xterm has
+// already measured its cellWidth (rare with font-display: block, but
+// possible during the block period or on very slow connections), force
+// every live xterm to remeasure + refit. Reassigning fontFamily to the
+// same value triggers xterm's option-change handler which re-measures the
+// monospace cell size against the (now-loaded) real font; the follow-up
+// _fit() then recomputes cols/rows so nothing overshoots.
+if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => {
+    for (const pane of PANES) {
+      try {
+        const family = pane.term.options.fontFamily
+        pane.term.options.fontFamily = family + ' '   // change → forces remeasure
+        pane.term.options.fontFamily = family         // restore canonical value
+        pane._fit()
+      } catch {}
+    }
+  })
+}
+
 // Reconnect backoff: 500ms → 1s → 2s → 4s → 8s → 10s cap
 const BACKOFF_BASE = 500
 const BACKOFF_MAX = 10000

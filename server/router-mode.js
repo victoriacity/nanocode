@@ -212,10 +212,16 @@ export function startRouterMode({
   // no-cache header on assets pinned before the v2 flush — re-firing
   // Clear-Site-Data once on the next page load gives every browser
   // a clean slate for the v1.3.0 mobile-composer fixes.
-  const CACHE_BUST_COOKIE = 'nano_cache_bust_v4'
+  const CACHE_BUST_COOKIE = 'nano_cache_bust_v5'
+  // Fire on any URL that LOOKS like an HTML page — not just `/`. SPA
+  // deep-links such as /local/<projectId> are how users actually open
+  // nanocode; restricting the bust to `/` left those users stranded on
+  // pre-fix CSS forever. Asset URLs (.css/.js/.woff2/etc.) are skipped
+  // so Clear-Site-Data fires at most once per page load.
+  const ASSET_EXT_RE = /\.(css|js|mjs|json|map|svg|ico|png|jpg|jpeg|gif|webp|avif|woff2?|ttf|otf|eot|wasm|mp3|wav|webmanifest)$/i
   app.use((req, res, next) => {
     const urlPath = (req.url || '').split('?')[0]
-    if (urlPath !== '/' && urlPath !== '/index.html') return next()
+    if (ASSET_EXT_RE.test(urlPath)) return next()
     const cookies = String(req.headers['cookie'] || '')
     if (cookies.includes(`${CACHE_BUST_COOKIE}=1`)) return next()
     res.setHeader('Clear-Site-Data', '"cache"')
