@@ -204,6 +204,30 @@ class Session {
       for (const ws of this._clients) {
         if (ws.readyState === 1) ws.send(msg)
       }
+      // Force the underlying tty.ReadStream to close so libuv actually
+      // removes the PTY-master fd from its epoll interest list.
+      //
+      // node-pty 1.1.0's own teardown short-circuits here: when the master
+      // has already emitted EIO (which happens on almost every PTY child
+      // exit because the kernel closes the slave first), `_socket.on('error')`
+      // sets `_emittedClose = true` and returns without ever calling
+      // `_socket.destroy()`. The C-level onexit callback then sees
+      // `_emittedClose` and takes the early-return path — again no destroy.
+      // The stream's autoDestroy-on-error is supposed to close the fd, but
+      // combined with Node 18's io_uring integration in libuv it races:
+      // IORING_OP_EPOLL_CTL(DEL) is submitted async, then close(fd) runs
+      // synchronously, kernel processes the SQE after the fd is gone,
+      // returns EBADF, and the epoll entry stays. Every subsequent
+      // epoll_pwait fires EPOLLHUP for that ghost — one such ghost is
+      // enough to pin the event loop at 100 % CPU (verified 2026-07-16
+      // and 2026-07-17: worker.sock alive, HTTP 502'd, epoll_pwait
+      // returning EPOLLHUP on a phantom fd 24 000 times per second).
+      //
+      // Calling destroy() explicitly here forces the poll_stop → epoll_ctl_del
+      // path to run while the file description is still fully alive on
+      // both sides, so the kernel actually reaps the interest-list entry
+      // before close(fd) runs. Safe to call multiple times.
+      try { this._proc?._socket?.destroy() } catch {}
     })
   }
 
@@ -299,6 +323,15 @@ class Session {
    */
   restart(cols, rows) {
     if (this._proc) {
+      // Order matters: destroy the tty.ReadStream BEFORE .kill() so the
+      // epoll deregistration runs while the fd, its file description, and
+      // its peer (the slave, still open in the not-yet-killed child) are
+      // all fully alive. Once we kill the child the slave-close path fires
+      // EIO on the master, node-pty flips `_emittedClose = true`, and its
+      // subsequent teardown short-circuits without ever destroying the
+      // socket — the source of the ghost-fd-in-epoll leak (see onExit
+      // handler above for the full analysis).
+      try { this._proc._socket?.destroy() } catch {}
       try {
         this._proc.kill()
       } catch {
@@ -316,6 +349,10 @@ class Session {
     if (this._flushTimer) clearTimeout(this._flushTimer)
     this._scrollback.flush()
     if (this._proc) {
+      // Same rationale as restart(): destroy the ReadStream before .kill()
+      // so libuv reaps the epoll interest-list entry while the file
+      // description is still fully alive.
+      try { this._proc._socket?.destroy() } catch {}
       try {
         this._proc.kill()
       } catch {
