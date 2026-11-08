@@ -1,6 +1,81 @@
 /** Persistent PTY sessions with scrollback. Sessions survive client disconnect. */
 
 import pty from 'node-pty'
+
+// ──────────────────────────────────────────────────────────────────────
+// node-pty 1.1.0 `_close()` monkey-patch (Option A root-cause fix).
+//
+// node-pty's own teardown leaves a time-bomb in libuv's epoll set every
+// time a PTY child dies naturally (user types `exit` in bash, a Claude
+// Code / Codex / OpenCode session ends, a process crashes). The sequence:
+//
+//   1. Kernel closes the PTY slave when the child exits.
+//   2. The master's `tty.ReadStream` gets EIO on its next read.
+//   3. node-pty's `_socket.on('error', EIO)` handler runs. It calls
+//      `_close()` (below) and sets `_emittedClose = true`.
+//   4. node-pty's C-level onexit callback fires. It sees `_emittedClose`
+//      is already true and takes the early-return branch at
+//      unixTerminal.js:88 — it never calls `_socket.destroy()`.
+//   5. Node's `Readable` autoDestroy on the error event eventually
+//      destroys the socket. This goes through libuv's io_uring path,
+//      which submits `IORING_OP_EPOLL_CTL(DEL)` as an async SQE and
+//      then calls `close(fd)` synchronously. Under any load the close
+//      syscall wins, the queued epoll_ctl_del lands against a now-closed
+//      fd, kernel returns EBADF, and the epoll interest-list entry
+//      stays forever.
+//
+// On the next `epoll_pwait`, that ghost entry fires EPOLLHUP
+// (level-triggered, because its peer — the already-closed slave — is
+// HUP). One ghost is enough to pin the event loop at 100% CPU: strace
+// shows ~24k epoll_pwait + ~24k io_uring_enter per second returning
+// immediately, every HTTP handler starves, `/api/projects` returns 502
+// with the characteristic ~106 ms proxy-retry-then-give-up signature.
+// Observed wedging after ~30 h pre-fix, ~22 days post-fix (commit
+// 76cb18a, which reordered restart/destroy to call `_socket.destroy()`
+// BEFORE `.kill()` and eliminated the equivalent race on the kill path).
+//
+// The patch below forces `_close()` to actually destroy the socket
+// instead of just flipping JS flags. That runs synchronously inside
+// node-pty's error handler, BEFORE `_emittedClose` is set — so libuv's
+// poll_stop / epoll_ctl_del can complete against a fully-alive file
+// description before any close race. Eliminates the Category 1 (natural
+// child exit) leak the same way 76cb18a eliminated Category 2
+// (nanocode-initiated kills).
+//
+// Risk: coupled to node-pty internals. If a future node-pty release
+// renames `Terminal.prototype._close` the patch becomes a no-op and the
+// leak returns silently. The startup assertion below throws if the
+// internal is missing, so an upgrade surfaces the mismatch immediately.
+import { createRequire } from 'node:module'
+{
+  // node-pty's index.js exports only spawn/fork/createTerminal/open/native;
+  // `Terminal` itself (with the `_close` method) lives in the submodule
+  // node-pty/lib/terminal.js. Reach into it via createRequire so the ESM
+  // import above stays clean.
+  const requireFromHere = createRequire(import.meta.url)
+  const Terminal = requireFromHere('node-pty/lib/terminal.js').Terminal
+  const origClose = Terminal?.prototype?._close
+  if (typeof origClose !== 'function') {
+    throw new Error(
+      '[nanocode] node-pty _close monkey-patch: Terminal.prototype._close not found. ' +
+      'This fix is pinned to node-pty 1.1.0; a version upgrade likely renamed the internal. ' +
+      'Audit node_modules/node-pty/lib/terminal.js before removing this check.'
+    )
+  }
+  if (!origClose.__nanocode_patched) {
+    const patched = function nanocodePatchedPtyClose () {
+      // Destroy the master-side tty.ReadStream synchronously, while the
+      // slave end is still open and libuv can run the full
+      // poll_stop → epoll_ctl_del → close path without racing itself.
+      try { this._socket?.destroy() } catch {}
+      return origClose.call(this)
+    }
+    patched.__nanocode_patched = true
+    Terminal.prototype._close = patched
+  }
+}
+
+
 import {
   existsSync,
   readFileSync,
